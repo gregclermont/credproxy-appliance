@@ -19,7 +19,8 @@ initramfs (`initramfs-init`) in `dkb/`. Output in `.tmp/alp/out/NAME`.
 Build time ~25 s. `CPVM_ENGINE=docker` runs it with Docker instead (as
 `.github/workflows/alpine-image.yml` does: the `lima` + `verity` variant on
 GitHub's x86_64 and arm64 runners, report in the job summary, image kept 3
-days, smoke boot under QEMU).
+days, smoke boot and verity tamper boots under QEMU with
+`spike/checks/image/smoke.sh`).
 
 - `apk`: Alpine's Docker (29.5.2, containerd 2.2, runc 1.4).
 - `static26`: the same image with Docker's static 26.1.4 binaries over

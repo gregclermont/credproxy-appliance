@@ -20,7 +20,8 @@ builder). CI: `.github/workflows/nixos-image.yml` runs this script on
 GitHub's x86_64 and arm64 runners (push to `spike/nixos/**` or
 `spike/mkosi/**`, or by hand), puts MANIFEST, sizes and the modules
 dropped in the job summary, keeps the image 3 days and smoke-boots it
-under QEMU. nixpkgs is pinned in `flake.lock`; bump it with
+under QEMU (`spike/checks/image/smoke.sh`, with verity tamper boots on
+x86_64). nixpkgs is pinned in `flake.lock`; bump it with
 `nix flake update` (in the same container) to take security fixes.
 
 - `flake.nix`: `nixosConfigurations.<system>` and `packages.<system>.appliance`,

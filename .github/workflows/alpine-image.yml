@@ -2,10 +2,25 @@ name: alpine-image
 
 on:
   workflow_dispatch:
+    inputs:
+      arches:
+        description: Architectures
+        type: choice
+        options: [both, x86_64]
+        default: both
+      arm64_smoke:
+        description: Boot smoke test on arm64 (TCG, slow; always on push)
+        type: boolean
+        default: false
+      zstd19:
+        description: Measure the zstd -19 size (slow; always on push)
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths:
       - spike/alpine/**
+      - spike/checks/image/**
       - .github/workflows/alpine-image.yml
 
 permissions:
@@ -20,13 +35,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: x86_64
-            runner: ubuntu-24.04
-          - arch: aarch64
-            runner: ubuntu-24.04-arm
+        include: ${{ fromJSON(inputs.arches == 'x86_64' && '[{"arch":"x86_64","runner":"ubuntu-24.04"}]' || '[{"arch":"x86_64","runner":"ubuntu-24.04"},{"arch":"aarch64","runner":"ubuntu-24.04-arm"}]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    env:
+      ZSTD19: ${{ github.event_name == 'push' || inputs.zstd19 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -53,7 +66,10 @@ jobs:
         run: |
           mkdir -p "$REPORT"
           cp "$OUT"/MANIFEST "$OUT"/packages.txt "$OUT"/initramfs-modules.txt "$OUT"/dkb/kernel.cmdline "$REPORT"/
-          zstd -19 -T0 -q -o "$OUT/cpvm.raw.zst" "$OUT/cpvm.raw"
+          zstd -3 -T0 -q -o "$OUT/cpvm.raw.zst" "$OUT/cpvm.raw"
+          if [ "$ZSTD19" = true ]; then
+            zst19=$(zstd -19 -T0 -q -c "$OUT/cpvm.raw" | wc -c)
+          fi
           (cd "$OUT" && sha256sum cpvm.raw cpvm.raw.zst dkb/*) >"$REPORT/sha256sums.txt"
           file -L "$OUT"/dkb/kernel "$OUT"/dkb/initrd >"$REPORT/kernel-file.txt"
           sfdisk -d "$OUT/cpvm.raw" >"$REPORT/partitions.txt"
@@ -65,7 +81,8 @@ jobs:
             echo "| | bytes | |"
             echo "|---|---|---|"
             echo "| cpvm.raw | $raw | $(mib "$raw") |"
-            echo "| cpvm.raw.zst (-19) | $zst | $(mib "$zst") |"
+            echo "| cpvm.raw.zst (-3, the artifact) | $zst | $(mib "$zst") |"
+            [ -z "${zst19:-}" ] || echo "| zstd -19 | $zst19 | $(mib "$zst19") |"
             echo "| dkb/kernel | $(stat -c %s "$OUT/dkb/kernel") | |"
             echo "| dkb/initrd | $(stat -c %s "$OUT/dkb/initrd") | |"
             echo
@@ -103,70 +120,21 @@ jobs:
           retention-days: 3
           compression-level: 0
 
-      # Direct kernel boot as Lima does it, without Lima: no cidata and no
-      # state disk. Expected: cpstate finds no state disk and carries on;
-      # lima-init fails at once (no cidata), and with it sshd (rc_need
-      # lima-init: no sshd before the Lima user exists) and lima-boot.
-      # Pass: the verity root mounted (the initramfs switches root only then),
-      # Docker started, OpenRC through the default runlevel (getty on hvc0).
+      # Direct kernel boot as Lima does it, with a minimal cidata and no
+      # state disk (spike/checks/image/smoke.sh); then the same boot of
+      # copies with 1 MiB of the verity data overwritten, which must panic.
       - name: Boot smoke test
+        if: matrix.arch == 'x86_64' || github.event_name == 'push' || inputs.arm64_smoke
         continue-on-error: true
         timeout-minutes: 20
         run: |
-          sudo apt-get update -qq
-          if [ "${{ matrix.arch }}" = aarch64 ]; then
-            sudo apt-get install -y -qq --no-install-recommends qemu-system-arm >/dev/null
-          else
-            sudo apt-get install -y -qq --no-install-recommends qemu-system-x86 >/dev/null
+          spike/checks/image/qemu-host.sh
+          rc=0
+          spike/checks/image/smoke.sh alpine "$OUT" "$REPORT" || rc=1
+          if [ "${{ matrix.arch }}" = x86_64 ]; then
+            for w in start mid; do spike/checks/image/smoke.sh alpine "$OUT" "$REPORT" $w || rc=1; done
           fi
-          if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; fi
-          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then accel=kvm; else accel=tcg; fi
-          if [ "${{ matrix.arch }}" = aarch64 ]; then
-            qemu=qemu-system-aarch64 machine=virt early=earlycon
-            [ $accel = kvm ] && cpu=host || cpu=max,pauth-impdef=on
-            wait=900
-          else
-            qemu=qemu-system-x86_64 machine=q35 early=earlycon=uart8250,io,0x3f8
-            [ $accel = kvm ] && cpu=host || cpu=max
-            wait=300
-          fi
-          echo "accel: $accel" | tee -a "$GITHUB_STEP_SUMMARY"
-          log=$REPORT/serial-hvc0.log early_log=$REPORT/serial-early.log
-          : >"$log"
-          start=$(date +%s)
-          $qemu -machine $machine,accel=$accel -cpu $cpu -smp 2 -m 2048 \
-            -display none -monitor none -no-reboot \
-            -kernel "$OUT/dkb/kernel" -initrd "$OUT/dkb/initrd" \
-            -append "$(cat "$OUT/dkb/kernel.cmdline") $early keep_bootcon" \
-            -drive if=none,id=img,file="$OUT/cpvm.raw",format=raw,readonly=on -device virtio-blk-pci,drive=img \
-            -netdev user,id=n0 -device virtio-net-pci,netdev=n0,romfile= \
-            -device virtio-serial-pci -chardev file,id=hvc,path="$log" -device virtconsole,chardev=hvc \
-            -serial file:"$early_log" &
-          pid=$!
-          result=timeout
-          while [ $(($(date +%s) - start)) -lt $wait ]; do
-            if ! kill -0 $pid 2>/dev/null; then result=exited; break; fi
-            if grep -qa 'login:' "$log"; then
-              # docker's start returns before the daemon answers: give it a moment
-              sleep 5
-              result=pass
-              grep -qaE '@@cpm [0-9.]+ switch' "$log" || result=no-switch
-              grep -qaE 'Starting Docker' "$log" || result="$result,no-docker"
-              # parallel services interleave their lines: match only docker's own error
-              ! grep -qaE 'ERROR: docker ' "$log" || result="$result,docker-error"
-              break
-            fi
-            sleep 2
-          done
-          elapsed=$(($(date +%s) - start))
-          kill $pid 2>/dev/null || true; wait $pid 2>/dev/null || true
-          {
-            echo "### boot smoke: $result after ${elapsed} s ($accel)"
-            echo '```'
-            grep -ahE 'verity|device-mapper|initramfs|@@cpm|Starting|ERROR|WARNING|cpstate|lima|sshd|docker|login:|Kernel panic' "$log" "$early_log" | head -60 || true
-            echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-          [ $result = pass ]
+          exit $rc
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()

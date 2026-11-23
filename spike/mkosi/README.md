@@ -81,7 +81,7 @@ CI: `.github/workflows/mkosi-image.yml` runs the same `build.sh` in a
 Debian 13 container (mkosi 25.3-7, `/src` and `/out` mounted as in the
 builder) on GitHub's x86_64 and arm64 runners, reports packages, sizes and
 roothash in the job summary, keeps the image 3 days and smoke-boots it under
-QEMU. The architecture is the build host's; per-architecture settings are in
+QEMU (`spike/checks/image/smoke.sh`, with verity tamper boots on x86_64). The architecture is the build host's; per-architecture settings are in
 `mkosi.conf.d/` and `initrd/mkosi.conf.d/`.
 
 Outputs: `$out/cpvm.raw`, `$out/dkb/{kernel,initrd,kernel.cmdline}`. Boot it
