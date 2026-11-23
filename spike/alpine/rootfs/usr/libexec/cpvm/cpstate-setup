@@ -1,46 +1,87 @@
 #!/bin/sh
-# spike/mkosi's cpstate-setup without udev: blkid probes the devices itself,
-# devtmpfs creates the partition node after sfdisk.
+# The workspace state disk (home, Docker data, the sshd host key), found
+# without udev. Chosen by device, never by label: guest root can write a
+# filesystem with the label to the image disk's free space. Lima attaches
+# it as the only writable virtio disk besides the image disk (cidata is
+# read-only, on QEMU a CD). Formatted only when entirely blank.
+#
+# A failure here leaves the VM without sshd, which the host would only see
+# as a timeout: it ends in a kernel panic after a "cpvm: FATAL" line.
 set -eu
 label=lima-cpstate
 state=/var/lib/cpstate
+
+fatal() {
+	trap - EXIT
+	echo "cpvm: FATAL: cpstate: $*" >/dev/console
+	echo 1 >/proc/sys/kernel/sysrq
+	echo c >/proc/sysrq-trigger
+	exit 1
+}
+trap 'fatal "unexpected exit (status $?)"' EXIT
 
 hostkey() {
 	mkdir -p -m 700 "$state/ssh"
 	[ -s "$state/ssh/ssh_host_ed25519_key" ] ||
 		ssh-keygen -q -t ed25519 -N '' -C '' -f "$state/ssh/ssh_host_ed25519_key"
 }
+# disk BLOCKDEV: the whole disk of a block device (a partition's parent, or itself)
+disk() {
+	b=$(readlink -f "/sys/class/block/$1")
+	if [ -e "$b/partition" ]; then b=${b%/*}; fi
+	echo "${b##*/}"
+}
 
-if part=$(blkid -L "$label" 2>/dev/null); then
+img=
+for s in /sys/block/dm-*/slaves/*; do
+	if [ -e "$s" ]; then img="$img $(disk "${s##*/}")"; fi
+done
+found=
+for b in /sys/block/vd*; do
+	[ -e "$b" ] || continue
+	d=${b##*/}
+	[ "$(cat "$b/ro")" = 0 ] && [ "$(cat "$b/removable")" = 0 ] || continue
+	case " $img " in *" $d "*) continue ;; esac
+	found="$found $d"
+done
+# shellcheck disable=SC2086 # device names, split on purpose
+set -- $found
+case $# in
+0)
+	echo "cpstate: no state disk, home stays ephemeral" >&2
+	hostkey
+	trap - EXIT
+	exit 0
+	;;
+1) ;;
+*) fatal "several writable disks besides the image disk (${found# }): cannot tell which is the state disk" ;;
+esac
+dev=/dev/$1 part=/dev/${1}1
+
+if [ -b "$part" ] && [ "$(blkid -p -o value -s TYPE "$part" 2>/dev/null)" = ext4 ] &&
+	[ "$(blkid -p -o value -s LABEL "$part" 2>/dev/null)" = "$label" ]; then
 	:
-else
-	blank=""
-	for d in /sys/block/vd*; do
-		dev=/dev/${d##*/}
-		blkid -p "$dev" >/dev/null 2>&1 && continue
-		blank="$blank $dev"
-	done
-	set -- $blank
-	if [ $# -eq 0 ]; then
-		echo "cpstate: no state disk, home stays ephemeral" >&2
-		hostkey
-		exit 0
-	elif [ $# -gt 1 ]; then
-		echo "cpstate: several blank disks ($*), refusing to pick one" >&2
-		exit 1
-	fi
-	echo "cpstate: first use, formatting $1" >&2
-	echo 'type=linux' | sfdisk -q --label gpt "$1"
-	part=${1}1
+elif [ ! -e "/sys/block/$1/${1}1" ] && ! blkid -p "$dev" >/dev/null 2>&1 &&
+	[ "$(head -c 1048576 "$dev" | tr -d '\0' | wc -c)" = 0 ]; then
+	echo "cpstate: first use, formatting $dev" >&2
+	echo 'type=linux' | sfdisk -q --label gpt "$dev"
 	n=0
-	until [ -b "$part" ]; do n=$((n + 1)); [ $n -lt 200 ] || exit 1; sleep 0.05; done
+	until [ -b "$part" ]; do n=$((n + 1)); [ $n -lt 200 ] || fatal "no $part after partitioning"; sleep 0.05; done
 	mkfs.ext4 -q -L "$label" "$part"
+else
+	fatal "$dev is neither a state disk (ext4 \"$label\" in partition 1) nor blank: $(blkid -p -o export "$dev" "$part" 2>/dev/null | grep -E '^(PTTYPE|TYPE|LABEL)=' | tr '\n' ' '): refusing to use or format it"
 fi
+echo "cpstate: state disk $part" >&2
 
+# the user writes the home: no set-uid or device files that count there
 mkdir -p "$state"
-mount -t ext4 -o noatime "$part" "$state"
+mount -t ext4 -o noatime,nosuid,nodev "$part" "$state"
 mkdir -p "$state/home" "$state/docker"
 mount --bind "$state/home" /home
+mount -o remount,bind,noatime,nosuid,nodev /home
+# Docker's container layers need set-uid binaries and device nodes
 mkdir -p /var/lib/docker
 mount --bind "$state/docker" /var/lib/docker
+mount -o remount,bind,noatime,suid,dev,exec /var/lib/docker
 hostkey
+trap - EXIT

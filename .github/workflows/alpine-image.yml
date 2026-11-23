@@ -121,19 +121,29 @@ jobs:
           compression-level: 0
 
       # Direct kernel boot as Lima does it, with a minimal cidata and no
-      # state disk (spike/checks/image/smoke.sh); then the same boot of
-      # copies with 1 MiB of the verity data overwritten, which must panic.
+      # state disk (spike/checks/image/smoke.sh). Allowed to fail: under
+      # emulation on arm64 a slow runner can time it out.
       - name: Boot smoke test
         if: matrix.arch == 'x86_64' || github.event_name == 'push' || inputs.arm64_smoke
         continue-on-error: true
         timeout-minutes: 20
         run: |
           spike/checks/image/qemu-host.sh
+          spike/checks/image/smoke.sh alpine "$OUT" "$REPORT"
+
+      # Boots of changed copies (spike/checks/image/tamper.py), each of
+      # which must end in a kernel panic after its own refusal line on the
+      # console: the regression test of the root of trust, so a failure
+      # fails the job. x86_64 under KVM only (2-8 s a boot).
+      - name: Tamper boots
+        if: matrix.arch == 'x86_64'
+        timeout-minutes: 20
+        env:
+          KINDS: start mid hashblock salt alg version dbs salt0 salt300 nb50 nb+1 nb+4096 guid p1shift p1shrink p2overlap p2shrink gptbackup mbr roothash rh-guid rh-none rh-empty rh-short rh-upper rh-dup cidata-none cidata-two
+        run: |
+          command -v qemu-system-x86_64 >/dev/null || spike/checks/image/qemu-host.sh
           rc=0
-          spike/checks/image/smoke.sh alpine "$OUT" "$REPORT" || rc=1
-          if [ "${{ matrix.arch }}" = x86_64 ]; then
-            for w in start mid; do spike/checks/image/smoke.sh alpine "$OUT" "$REPORT" $w || rc=1; done
-          fi
+          for w in $KINDS; do spike/checks/image/smoke.sh alpine "$OUT" "$REPORT" "$w" || rc=1; done
           exit $rc
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

@@ -2,11 +2,63 @@
 # spike/mkosi's lima-init for OpenRC (no systemd: no guest agent unit, no
 # linger): the user, its key and the cidata mount. Lima's boot.sh runs from
 # the lima-boot service (the `lima` variant), not here.
+#
+# Without it there is no sshd, which the host would only see as a timeout:
+# a failure ends in a kernel panic after a "cpvm: FATAL" line. A shared
+# folder that does not mount stays a warning.
 set -eu
 mnt=/mnt/lima-cidata
+
+fatal() {
+	trap - EXIT
+	echo "cpvm: FATAL: lima-init: $*" >/dev/console
+	echo 1 >/proc/sys/kernel/sysrq
+	echo c >/proc/sysrq-trigger
+	exit 1
+}
+trap 'fatal "unexpected exit (status $?)"' EXIT
+
+# disk: the whole disk of block device $1 (a partition's parent, or itself)
+disk() {
+	b=$(readlink -f "/sys/class/block/$1")
+	if [ -e "$b/partition" ]; then b=${b%/*}; fi
+	echo "${b##*/}"
+}
+# cidata: the device Lima's cloud-init volume is on. Never by label alone:
+# boot.sh from it runs as root at every boot, and guest root can write a
+# filesystem labelled cidata to any writable disk. The host attaches it
+# read-only and nothing else is: on QEMU the only CD (virtio-scsi), on VZ a
+# virtio disk after the image and state disks. So: whole disks the kernel
+# sees as read-only, neither the disk under the verity root nor the state
+# disk, holding iso9660 labelled cidata; exactly one, or no cidata at all.
+cidata() {
+	skip=
+	for s in /sys/block/dm-*/slaves/*; do
+		if [ -e "$s" ]; then skip="$skip $(disk "${s##*/}")"; fi
+	done
+	src=$(awk '$2 == "/var/lib/cpstate" { print $1 }' /proc/mounts)
+	[ -z "$src" ] || skip="$skip $(disk "${src#/dev/}")"
+	skip=$(echo $skip | tr ' ' '\n' | sort -u | tr '\n' ' ')
+	found=
+	for b in /sys/block/sr* /sys/block/vd*; do
+		[ -e "$b" ] || continue
+		d=${b##*/}
+		[ "$(cat "$b/ro")" = 1 ] || continue
+		case " $skip " in *" $d "*) continue ;; esac
+		[ "$(blkid -p -o value -s TYPE "/dev/$d" 2>/dev/null)" = iso9660 ] || continue
+		[ "$(blkid -p -o value -s LABEL "/dev/$d" 2>/dev/null)" = cidata ] || continue
+		found="$found /dev/$d"
+	done
+	# shellcheck disable=SC2086 # device names, split on purpose
+	set -- $found
+	[ $# = 1 ] || fatal "refusing cidata: want one read-only iso9660 disk labelled cidata, found: ${found:-none} (image/state disks: ${skip:-none})"
+	echo "$1"
+}
+
 mkdir -p -m 700 "$mnt"
 if ! mountpoint -q "$mnt"; then
-	dev=$(blkid -L cidata)
+	dev=$(cidata)
+	echo "lima-init: cidata on $dev" >&2
 	mount -t iso9660 -o ro,mode=0700,dmode=0700,overriderockperm,exec,uid=0 "$dev" "$mnt"
 fi
 ud=$mnt/user-data
@@ -31,10 +83,15 @@ if [ "$LIMA_CIDATA_PASSWORDLESS_SUDO" = 1 ]; then
 else
 	echo "$u ALL=(ALL) ALL" >/etc/sudoers.d/90-lima-users
 fi
-install -d -m 700 -o "$u" -g "$(id -g "$u")" "$home/.ssh"
-sed -n '/^ *ssh[-_]authorized[-_]keys:/,/^ *[^ -]/{s/^ *- *"\(.*\)"$/\1/p}' "$ud" >"$home/.ssh/authorized_keys"
-chown "$u:$(id -g "$u")" "$home/.ssh/authorized_keys"
-chmod 600 "$home/.ssh/authorized_keys"
+# The home is on the state disk, which the user writes: ~/.ssh and the key
+# file are written as the user, so a link planted there leads nowhere the
+# user could not write anyway.
+sed -n '/^ *ssh[-_]authorized[-_]keys:/,/^ *[^ -]/{s/^ *- *"\(.*\)"$/\1/p}' "$ud" |
+	su -s /bin/sh "$u" -c 'set -e; umask 077; cd
+		if [ -L .ssh ] || { [ -e .ssh ] && [ ! -d .ssh ]; }; then rm -f .ssh; fi
+		mkdir -p .ssh; chmod 700 .ssh
+		t=$(mktemp .ssh/.authorized_keys.XXXXXX); cat >"$t"; mv -f "$t" .ssh/authorized_keys' ||
+	fatal "writing $u's authorized_keys"
 
 tab=$(printf '\t')
 sed -n '/^mounts:/,/^[^ -]/{s/^- *\[\(.*\)\]$/\1/p}' "$ud" | tr -d '"' | sed "s/, /$tab/g" |
@@ -48,3 +105,4 @@ etcenv=/etc/environment
 cat "$mnt/etc_environment" >>"$etcenv"
 : >/run/credproxy-ssh-stable
 echo "$LIMA_CIDATA_IID" >/run/lima-ssh-ready
+trap - EXIT

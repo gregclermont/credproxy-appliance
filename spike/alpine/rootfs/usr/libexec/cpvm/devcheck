@@ -1,0 +1,47 @@
+#!/bin/sh
+# Devices left without a driver. The image has no device manager: cphw loads
+# a fixed module list, and a device whose driver is not on it (or not in the
+# kernel) stays unbound without a word. Run after cphw's modprobe; writes
+# one line per unbound device to /run/cpvm/devcheck (empty: all bound) and
+# warns on the console.
+#
+# Checked: every virtio device, every SCSI device, every PCI device except
+# the classes the image leaves without a driver on purpose (host and ISA bridges,
+# SMBus, USB host controllers: chipset parts and the empty USB controller Lima
+# gives a QEMU guest, none of them used here).
+out=/run/cpvm/devcheck
+mkdir -p /run/cpvm
+: >"$out.tmp"
+for d in /sys/bus/virtio/devices/* /sys/bus/pci/devices/* /sys/bus/scsi/devices/*; do
+	[ -e "$d" ] || continue
+	[ ! -e "$d/driver" ] || continue
+	bus=${d#/sys/bus/}
+	bus=${bus%%/*}
+	what=
+	case $bus in
+	virtio)
+		# virtio device ids (virtio spec, "Device Types")
+		id=$(($(cat "$d/device")))
+		case $id in
+		1) what=net ;; 2) what=block ;; 3) what=console ;; 4) what=entropy ;;
+		5) what=balloon ;; 8) what=scsi ;; 9) what=9p ;; 16) what=gpu ;;
+		18) what=input ;; 19) what=vsock ;; 26) what=fs ;; *) what="device id $id" ;;
+		esac
+		;;
+	pci)
+		class=$(cat "$d/class")
+		case $class in 0x0600* | 0x0601* | 0x0c03* | 0x0c05*) continue ;; esac
+		what="class $class vendor $(cat "$d/vendor") device $(cat "$d/device")"
+		;;
+	scsi)
+		[ -e "$d/type" ] || continue
+		what="type $(cat "$d/type") $(cat "$d/vendor" 2>/dev/null) $(cat "$d/model" 2>/dev/null)"
+		;;
+	esac
+	echo "$bus ${d##*/}: $what" >>"$out.tmp"
+done
+mv "$out.tmp" "$out"
+while read -r l; do
+	echo "cpvm devcheck: WARNING: no driver for $l" >/dev/console
+done <"$out"
+exit 0

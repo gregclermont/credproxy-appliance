@@ -13,6 +13,11 @@ command_background=yes
 pidfile=/run/cpcontainerd.pid
 output_log=/var/log/containerd.log
 error_log=/var/log/containerd.log
+# Every shim and container inherits containerd's limits: those of Debian's
+# containerd.service (LimitNOFILE/LimitNPROC/LimitCORE=infinity) as Alpine's
+# docker service writes them, else OpenRC's 1024/4096 files reach every
+# container.
+rc_ulimit="${CPCONTAINERD_ULIMIT:--c unlimited -n 1048576 -u unlimited}"
 depend() { need cpstate; }
 start_post() {
 	n=0
@@ -20,4 +25,7 @@ start_post() {
 		n=$((n + 1)); [ $n -lt 500 ] || return 1
 		sleep 0.01
 	done
+	# OOMScoreAdjust=-999, as Debian's unit: the OOM killer takes a
+	# container before the runtime
+	echo -999 >"/proc/$(cat "$pidfile")/oom_score_adj"
 }

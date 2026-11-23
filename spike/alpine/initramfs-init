@@ -1,57 +1,173 @@
 #!/bin/sh
-# Root = erofs, read-only, under a tmpfs overlay (as the mkosi image's
-# systemd.volatile=overlay). With a hex roothash= on the cmdline: the erofs
-# is /dev/vda1, opened through dm-verity with /dev/vda2 as the hash device
-# (veritysetup's on-disk format: superblock in block 0, tree from block 1),
-# panic_on_corruption. Without one: the erofs is /dev/vda, unverified.
+# PID 1 of the initramfs (static busybox): open the dm-verity root that
+# roothash= names, put a tmpfs overlay on it (as systemd.volatile=overlay)
+# and switch_root into its /sbin/init.
+#
+# There is no unverified path. Every failure ends in a kernel panic on the
+# console, which credproxy's start watches for: checked failures through
+# fail(), anything else through set -e and the EXIT trap (and, should those
+# fail too, PID 1 exiting, which the kernel also turns into a panic). No
+# shell, no wait without a deadline. The kernel command line is read for
+# roothash= only: init=, rdinit= (beyond what the kernel itself does with it)
+# and break= mean nothing here.
+#
+# Image disk layout (mkimage.sh): /dev/vda, GPT, partition 1 the erofs root,
+# partition 2 its veritysetup hash device (superblock in block 0, tree from
+# block 1); the partitions' unique GUIDs are the two halves of the root hash
+# (systemd's convention), so another disk in vda's place is refused, not used.
+set -eu
+set -f
+PATH=/bin
+nl='
+'
+IFS=" $(printf '\t')$nl"
+
 /bin/busybox --install -s /bin
-mount -t devtmpfs dev /dev
-mount -t proc proc /proc
-mount -t sysfs sys /sys
+mount -t devtmpfs -o nosuid,mode=0755 dev /dev
+mount -t proc -o nosuid,nodev,noexec proc /proc
+mount -t sysfs -o nosuid,nodev,noexec sys /sys
 exec </dev/console >/dev/console 2>&1
-# fail closed and visibly: credproxy watches the console for "Kernel panic"
-fail() { echo "initramfs: $*"; echo 1 >/proc/sys/kernel/sysrq; echo c >/proc/sysrq-trigger; }
-while read -r m; do insmod /lib/modules/$m || fail "insmod $m"; done </modules
-waitdev() {
-	n=0
+
+fail() {
+	trap - EXIT
+	echo "cpvm-initramfs: FATAL: $*" >/dev/console
+	echo 1 >/proc/sys/kernel/sysrq
+	echo c >/proc/sysrq-trigger
+	exit 1
+}
+trap 'fail "unexpected exit (status $?)"' EXIT
+log() { echo "cpvm-initramfs: $*"; }
+
+# whole seconds of uptime, in $up
+now() {
+	read -r up _ </proc/uptime
+	up=${up%.*}
+}
+# waitblk DEV SECONDS: until DEV is a block device, at most SECONDS (+1)
+waitblk() {
+	now
+	end=$((up + $2 + 1))
 	until [ -b "$1" ]; do
-		n=$((n + 1)); [ $n -lt 500 ] || fail "no $1"
-		usleep 10000
+		now
+		[ "$up" -lt "$end" ] || fail "no block device $1 after $2 s"
+		usleep 20000
 	done
 }
-rh=
+# num FILE OFFSET BYTES: unsigned little-endian integer (1, 2, 4 or 8 bytes)
+num() {
+	n=$(od -A n -t "u$3" -j "$2" -N "$3" "$1" | tr -d " $nl")
+	case $n in '' | *[!0-9]*) fail "cannot read $3 bytes at $2 of $1" ;; esac
+	echo "$n"
+}
+# hex FILE OFFSET BYTES: those bytes as lowercase hex, in disk order
+hex() {
+	od -A n -v -t x1 -j "$2" -N "$3" "$1" | tr -d " $nl"
+}
+# guid FILE OFFSET: the GPT GUID at OFFSET in its text form, lowercase, no dashes
+# (the first three fields are stored little-endian)
+guid() {
+	g=$(hex "$1" "$2" 16)
+	[ ${#g} = 32 ] || fail "cannot read a GUID at $2 of $1"
+	echo "$g" | sed 's/^\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)/\4\3\2\1\6\5\8\7/'
+}
+
+while read -r m; do
+	insmod "/lib/modules/$m" || fail "insmod $m"
+done </modules
+
+rh='' n=0
 for a in $(cat /proc/cmdline); do
-	case $a in roothash=*) rh=${a#roothash=} ;; esac
+	case $a in roothash=*) rh=${a#roothash=} n=$((n + 1)) ;; esac
 done
-case $rh in
-*[!0-9a-f]* | "") rh= ;;
-esac
-if [ ${#rh} = 64 ]; then
-	waitdev /dev/vda1; waitdev /dev/vda2
-	h=/dev/vda2
-	# superblock fields (struct verity_sb): the root hash commits to the
-	# tree they describe, so a wrong value fails verification, not opens
-	[ "$(head -c 6 $h)" = verity ] || fail "no verity superblock on $h"
-	alg=$(head -c 64 $h | tail -c 32 | tr -d '\0')
-	dbs=$(od -A n -t u4 -j 64 -N 4 $h | tr -d ' ')
-	hbs=$(od -A n -t u4 -j 68 -N 4 $h | tr -d ' ')
-	nb=$(od -A n -t u8 -j 72 -N 8 $h | tr -d ' ')
-	sl=$(od -A n -t u2 -j 80 -N 2 $h | tr -d ' ')
-	salt=$(od -A n -t x1 -j 88 -N "$sl" $h | tr -d ' \n')
-	[ "$alg" = sha256 ] && [ "$dbs" = 4096 ] && [ "$hbs" = 4096 ] || fail "unexpected verity parameters"
-	dmsetup create --readonly --noudevsync root --table \
-		"0 $((nb * 8)) verity 1 /dev/vda1 $h 4096 4096 $nb 1 sha256 $rh ${salt:--} 1 panic_on_corruption" ||
-		fail "dm-verity"
-	waitdev /dev/dm-0
-	mount -t erofs -o ro /dev/dm-0 /lower || fail "mount root"
-else
-	waitdev /dev/vda
-	mount -t erofs -o ro /dev/vda /lower || fail "mount root"
-fi
-mount -t tmpfs -o mode=0755 rw /rw
+[ $n = 1 ] || fail "need exactly one roothash= on the kernel command line, found $n"
+case $rh in *[!0-9a-f]*) fail "roothash= is not lowercase hex" ;; esac
+[ ${#rh} = 64 ] || fail "roothash= has ${#rh} hex digits, not 64 (sha256)"
+
+disk=/dev/vda data=/dev/vda1 hash=/dev/vda2
+waitblk $disk 10
+
+# GPT: primary header at LBA 1; the image's table has 128-byte entries
+# starting between LBA 2 and 64. Only entries 1 and 2 are read.
+[ "$(hex $disk 512 8)" = 4546492050415254 ] || fail "$disk: no GPT header (is the image disk vda?)"
+elba=$(num $disk 584 8)
+nent=$(num $disk 592 4)
+esz=$(num $disk 596 4)
+[ "$esz" = 128 ] && [ "$nent" -ge 2 ] && [ "$nent" -le 128 ] && [ "$elba" -ge 2 ] && [ "$elba" -le 64 ] ||
+	fail "$disk: unexpected GPT (entries at LBA $elba, $nent of $esz bytes)"
+u1=$(guid $disk $((elba * 512 + 16)))
+u2=$(guid $disk $((elba * 512 + 128 + 16)))
+r1=${rh%????????????????????????????????}
+r2=${rh#????????????????????????????????}
+[ "$u1" = "$r1" ] && [ "$u2" = "$r2" ] ||
+	fail "$disk: partitions $u1 $u2 are not those of roothash=$rh (is the image disk vda?)"
+# the kernel adds the partitions with the disk: the wait is only a margin
+waitblk $data 1
+waitblk $hash 1
+# The kernel may have taken its partitions from the backup GPT (or an MBR)
+# when the primary is damaged; the GUIDs above are the primary's. Both must
+# describe the same extents.
+for i in 1 2; do
+	e=$((elba * 512 + (i - 1) * 128))
+	first=$(num $disk $((e + 32)) 8)
+	last=$(num $disk $((e + 40)) 8)
+	[ "$(cat /sys/class/block/vda$i/start)" = "$first" ] && [ "$(cat /sys/class/block/vda$i/size)" = $((last - first + 1)) ] ||
+		fail "$disk: partition $i in use is not the one the primary GPT describes"
+done
+
+# veritysetup superblock (struct verity_sb). Not covered by the root hash:
+# each field is either checked against the one value the image uses or
+# bounded, and the data block count is checked again below against the
+# filesystem read through the verified device.
+[ "$(hex $hash 0 8)" = 7665726974790000 ] || fail "$hash: no verity superblock"
+[ "$(num $hash 8 4)" = 1 ] && [ "$(num $hash 12 4)" = 1 ] || fail "$hash: verity superblock version or hash type is not 1"
+[ "$(hex $hash 32 32)" = 7368613235360000000000000000000000000000000000000000000000000000 ] ||
+	fail "$hash: hash algorithm is not sha256"
+[ "$(num $hash 64 4)" = 4096 ] && [ "$(num $hash 68 4)" = 4096 ] || fail "$hash: block sizes are not 4096"
+nb=$(num $hash 72 8)
+sl=$(num $hash 80 2)
+[ "$sl" -ge 1 ] && [ "$sl" -le 256 ] || fail "$hash: salt size $sl"
+salt=$(hex $hash 88 "$sl")
+[ ${#salt} = $((sl * 2)) ] || fail "$hash: short salt"
+psec=$(cat /sys/class/block/vda1/size)
+case $psec in '' | *[!0-9]*) fail "size of $data" ;; esac
+# 18 digits: the product below cannot overflow
+[ ${#nb} -le 18 ] && [ "$nb" -ge 1 ] && [ $((nb * 8)) -le "$psec" ] ||
+	fail "$hash: $nb data blocks do not fit $data ($psec sectors)"
+
+dmsetup create root --readonly --noudevsync --table \
+	"0 $((nb * 8)) verity 1 $data $hash 4096 4096 $nb 1 sha256 $rh $salt 2 panic_on_corruption panic_on_error" ||
+	fail "dm-verity table for $data $hash"
+root=/dev/dm-0
+[ "$(cat /sys/block/dm-0/dm/name)" = root ] || fail "dm-0 is not the verity root"
+waitblk $root 1
+
+# A data block count other than the filesystem's still verifies: smaller
+# leaves the end of the root unreadable (I/O errors, not corruption), larger
+# maps blocks the build never hashed. The image is built with the two
+# equal. The erofs
+# superblock, read through the verified device, says how many blocks the
+# filesystem has (struct erofs_super_block at byte 1024: magic, blkszbits at
+# +12, blocks_lo at +36, feature_incompat at +80, whose 0x80 bit, 48-bit
+# block counts, the image does not use).
+[ "$(hex $root 1024 4)" = e2e1f5e0 ] || fail "no erofs on the verity root"
+[ "$(num $root 1036 1)" = 12 ] || fail "erofs block size is not 4096"
+[ $(($(num $root 1104 4) & 128)) = 0 ] || fail "erofs uses 48-bit block counts"
+fsb=$(num $root 1060 4)
+[ "$fsb" = "$nb" ] || fail "verity covers $nb blocks, the root filesystem has $fsb"
+log "verity root on $data (hash $hash), $nb blocks, filesystem $fsb"
+
+mount -t erofs -o ro $root /lower || fail "mount the root"
+mount -t tmpfs -o mode=0755 rw /rw || fail "tmpfs for the overlay"
 mkdir -p /rw/upper /rw/work
 mount -t overlay -o lowerdir=/lower,upperdir=/rw/upper,workdir=/rw/work root /newroot || fail "overlay"
-read -r up _ </proc/uptime
+# /sbin/init, through one symlink resolved inside the new root
+i=/newroot/sbin/init
+if [ -L $i ]; then
+	t=$(readlink $i)
+	case $t in /*) i=/newroot$t ;; *) i=/newroot/sbin/$t ;; esac
+fi
+[ -f "$i" ] && [ -x "$i" ] || fail "no /sbin/init in the root"
 for d in dev proc sys; do mount --move /$d /newroot/$d; done
+read -r up _ </newroot/proc/uptime
 echo "@@cpm $up switch"
-exec switch_root /newroot /sbin/init
+exec env -i switch_root /newroot /sbin/init

@@ -1,7 +1,9 @@
 #!/bin/sh
-# Runs inside an alpine:3.23 container (build.sh): root filesystem with
-# `apk --root`, cpvm.raw = that root as erofs (lz4hc, as the mkosi image), the
-# linux-virt kernel and a busybox initramfs (initramfs-init) in dkb/.
+# Runs inside an alpine:3.24 container (build.sh): root filesystem with
+# `apk --root`, cpvm.raw = GPT with that root as erofs (lz4hc, as the mkosi
+# image) and its dm-verity hash partition (veritysetup format), the linux-virt
+# kernel, a busybox initramfs (initramfs-init) and the cmdline with roothash=
+# in dkb/.
 # DOCKER=apk: Alpine's docker-engine. DOCKER=static26: Alpine's package with
 # its binaries replaced by Docker's static 26.1.4 (/dl/docker-26.1.4.tgz), to
 # separate Docker's version from the rest of the image.
@@ -16,9 +18,6 @@ DOCKER=${DOCKER:-apk}
 LIMA=${LIMA:-0}
 # CTRD=1: containerd as its own OpenRC service (ctrd/), dockerd pointed at it.
 CTRD=${CTRD:-0}
-# VERITY=1: cpvm.raw = GPT, root erofs + its dm-verity hash partition
-# (veritysetup format), roothash= on the cmdline, opened by the initramfs.
-VERITY=${VERITY:-0}
 apk add -q erofs-utils kmod cpio busybox-static zstd cryptsetup device-mapper-static sfdisk
 mkdir -p $R/etc/apk
 cp -a /etc/apk/keys $R/etc/apk/
@@ -60,7 +59,7 @@ rl() { mkdir -p $R/etc/runlevels/$2 && ln -sf /etc/init.d/$1 $R/etc/runlevels/$2
 rm -rf $R/etc/runlevels/*/*
 for s in devfs sysfs cgroups cpprefetch cphw; do rl $s sysinit; done
 [ "$LIMA" = 1 ] || rl cpprobe sysinit
-for s in cpmodules sysctl cpstate cpnet lima-init sshd docker; do rl $s default; done
+for s in cpmodules sysctl cpstate cpnet lima-init sshd docker cplog; do rl $s default; done
 [ "$LIMA" != 1 ] || { rl lima-boot default; rl acpid default; }
 [ "$CTRD" != 1 ] || rl cpcontainerd default
 
@@ -96,11 +95,8 @@ cp /bin/busybox.static $I/bin/busybox
 ln -s busybox $I/bin/sh
 cp $S/initramfs-init $I/init && chmod 755 $I/init
 : >$I/modules
-mods="virtio_blk erofs overlay"
-if [ "$VERITY" = 1 ]; then
-	mods="$mods dm-verity"
-	cp /usr/sbin/dmsetup.static $I/bin/dmsetup
-fi
+mods="virtio_blk erofs overlay dm-verity"
+cp /usr/sbin/dmsetup.static $I/bin/dmsetup
 modprobe -d $R -S "$kver" --show-depends -a $mods | awk '$1 == "insmod" {print $2}' |
 	while read -r m; do
 		n=${m##*/}; n=${n%.gz}
@@ -110,37 +106,37 @@ modprobe -d $R -S "$kver" --show-depends -a $mods | awk '$1 == "insmod" {print $
 	done
 (cd $I && find . | cpio -o -H newc --quiet | gzip -9) >$O/dkb/initrd
 
-cl="console=hvc0 net.ifnames=0 page_reporting.page_reporting_order=0"
-if [ "$VERITY" = 1 ]; then
-	W=/work/img
-	mkdir -p $W
-	mkfs.erofs --quiet -zlz4hc $W/root $R
-	: >$W/hash
-	rh=$(veritysetup format $W/root $W/hash | sed -n 's/^Root hash:[[:space:]]*//p')
-	[ ${#rh} = 64 ] || { echo "veritysetup format failed" >&2; exit 1; }
-	mib=1048576
-	pad() { s=$(stat -c %s "$1"); truncate -s $(( (s + mib - 1) / mib * mib )) "$1"; stat -c %s "$1"; }
-	rs=$(pad $W/root) hs=$(pad $W/hash)
-	head -c $mib /dev/zero >$W/lead
-	cat $W/lead $W/root $W/hash $W/lead >$O/cpvm.raw
-	rm -f $W/root $W/hash
-	# root and root-verity partition types (discoverable partitions spec)
-	case $(apk --print-arch) in
-	x86_64) pr=4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709 pv=2C7357ED-EBD2-46D9-AEC1-23D437EC2BF5 ;;
-	aarch64) pr=B921B045-1DF0-41C3-AF44-4C6F280D3FAE pv=DF3300CE-D69F-4C92-978C-9BFB0F38D820 ;;
-	*) echo "no partition types for $(apk --print-arch)" >&2; exit 1 ;;
-	esac
-	sfdisk -q --label gpt $O/cpvm.raw <<EOT
-start=2048, size=$((rs / 512)), type=$pr, name=root
-start=$((2048 + rs / 512)), size=$((hs / 512)), type=$pv, name=root-verity
+W=/work/img
+mkdir -p $W
+mkfs.erofs --quiet -zlz4hc $W/root $R
+: >$W/hash
+rh=$(veritysetup format $W/root $W/hash | sed -n 's/^Root hash:[[:space:]]*//p')
+case $rh in *[!0-9a-f]*) rh= ;; esac
+[ ${#rh} = 64 ] || { echo "veritysetup format failed" >&2; exit 1; }
+mib=1048576
+pad() { s=$(stat -c %s "$1"); truncate -s $(( (s + mib - 1) / mib * mib )) "$1"; stat -c %s "$1"; }
+rs=$(pad $W/root) hs=$(pad $W/hash)
+head -c $mib /dev/zero >$W/lead
+cat $W/lead $W/root $W/hash $W/lead >$O/cpvm.raw
+rm -f $W/root $W/hash
+# root and root-verity partition types (discoverable partitions spec)
+case $(apk --print-arch) in
+x86_64) pr=4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709 pv=2C7357ED-EBD2-46D9-AEC1-23D437EC2BF5 ;;
+aarch64) pr=B921B045-1DF0-41C3-AF44-4C6F280D3FAE pv=DF3300CE-D69F-4C92-978C-9BFB0F38D820 ;;
+*) echo "no partition types for $(apk --print-arch)" >&2; exit 1 ;;
+esac
+# partition GUIDs = the root hash's halves (systemd's convention): the
+# initramfs refuses a disk whose partitions are not this image's
+uuid() { echo "$1" | sed 's/^\(.\{8\}\)\(.\{4\}\)\(.\{4\}\)\(.\{4\}\)/\1-\2-\3-\4-/'; }
+ur=$(uuid "$(echo "$rh" | cut -c1-32)") uv=$(uuid "$(echo "$rh" | cut -c33-64)")
+sfdisk -q --label gpt $O/cpvm.raw <<EOT
+start=2048, size=$((rs / 512)), type=$pr, uuid=$ur, name=root
+start=$((2048 + rs / 512)), size=$((hs / 512)), type=$pv, uuid=$uv, name=root-verity
 EOT
-	cl="roothash=$rh $cl"
-else
-	mkfs.erofs --quiet -zlz4hc $O/cpvm.raw $R
-fi
+cl="roothash=$rh console=hvc0 net.ifnames=0 page_reporting.page_reporting_order=0"
 echo "$cl" >$O/dkb/kernel.cmdline
 {
-	echo "alpine: $(cat $R/etc/alpine-release) kernel: $kver docker: $DOCKER lima: $LIMA ctrd: $CTRD verity: $VERITY"
+	echo "alpine: $(cat $R/etc/alpine-release) kernel: $kver docker: $DOCKER lima: $LIMA ctrd: $CTRD"
 	chroot $R apk info -v 2>/dev/null | sort
 } >$O/packages.txt
 chroot $R /usr/bin/dockerd --version >>$O/packages.txt 2>&1 || true

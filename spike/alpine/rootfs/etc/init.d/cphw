@@ -4,4 +4,17 @@ description="Drivers for the VM's devices"
 # provides dev: what udev/mdev provide, which acpid needs
 depend() { after devfs; provide dev; }
 # vmw_vsock_virtio_transport: VZ's vsock (Lima's guest agent, time sync); in sysinit, so before lima-guestagent
-start() { modprobe -a virtio_net virtio_rng virtio_balloon virtio_scsi sr_mod isofs ext4 button vmw_vsock_virtio_transport 2>/dev/null; return 0; }
+# virtiofs: shared folders, bound here rather than at their first mount
+start() {
+	modprobe -a virtio_net virtio_rng virtio_balloon virtio_scsi sr_mod isofs ext4 button vmw_vsock_virtio_transport virtiofs 2>/dev/null
+	# KVM when the host lets the guest nest (no udev to load it from the CPU's
+	# flags), usable by any user as on the mkosi image: a workspace container
+	# passes it with only --device /dev/kvm; the VM is the boundary
+	if grep -qw vmx /proc/cpuinfo; then modprobe kvm_intel 2>/dev/null; fi
+	if grep -qw svm /proc/cpuinfo; then modprobe kvm_amd 2>/dev/null; fi
+	if [ -c /dev/kvm ]; then chmod 0666 /dev/kvm; fi
+	# a device left without a driver: a warning on the console and in
+	# /run/cpvm/devcheck; the boot goes on
+	/usr/libexec/cpvm/devcheck
+	return 0
+}

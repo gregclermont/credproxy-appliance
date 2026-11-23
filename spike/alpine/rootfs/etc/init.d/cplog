@@ -1,0 +1,11 @@
+#!/sbin/openrc-run
+# System log in a RAM ring buffer (busybox syslogd, read with logread),
+# started after sshd and Docker and providing no "logger", so that nothing
+# on the way to them waits for it: what is logged before it runs is lost.
+# Lost at shutdown too.
+description="System log in memory (logread)"
+command=/sbin/syslogd
+command_args="-n -C512"
+command_background=yes
+pidfile=/run/syslogd.pid
+depend() { after sshd docker; }

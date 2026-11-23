@@ -5,5 +5,9 @@ description="Kernel modules Lima's boot scripts and dockerd load"
 start() {
 	(modprobe -a fuse tun tap bridge veth ip_tables ip6_tables iptable_nat ip6table_nat iptable_filter \
 		ip6table_filter nf_tables x_tables xt_MASQUERADE xt_addrtype xt_comment xt_conntrack xt_mark \
-		xt_multiport xt_nat xt_tcpudp overlay br_netfilter 2>/dev/null &)
+		xt_multiport xt_nat xt_tcpudp overlay br_netfilter 2>/dev/null
+		# as udev and systemd set them up: /dev/net/tun usable by all
+		# (rootless network helpers), binfmt_misc mounted for emulators
+		chmod 0666 /dev/net/tun 2>/dev/null
+		modprobe binfmt_misc 2>/dev/null && mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null &)
 }
