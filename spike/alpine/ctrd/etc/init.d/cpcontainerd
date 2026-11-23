@@ -1,8 +1,10 @@
 #!/sbin/openrc-run
 # containerd as its own service, dockerd pointed at it (as Debian's
 # containerd.service): dockerd 26's managed containerd costs ~1 s at start
-# (its first dial to the new containerd waits out a 1 s backoff). Same root
-# and state as the managed one, so the state disk's data is found either way;
+# (its first dial to the new containerd waits out a 1 s backoff), dockerd
+# 29's 1 s at stop (between "stopping event stream" and "Daemon shutdown
+# complete"). Same root and state as the managed one, so the state disk's
+# data is found either way;
 # its own config (Alpine's is containerd 2's format, which 1.7 rejects).
 description="containerd"
 command=/usr/bin/containerd

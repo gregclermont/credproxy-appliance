@@ -1,5 +1,5 @@
 #!/bin/sh
-# usage: build.sh NAME [apk|static26] [lima|nolima] [ctrd|noctrd] [verity] -> $OUT/NAME/{cpvm.raw,dkb/{kernel,initrd,kernel.cmdline},packages.txt,MANIFEST}
+# usage: build.sh NAME [apk|static26] [lima|nolima] [ctrd|noctrd|-] [verity] -> $OUT/NAME/{cpvm.raw,dkb/{kernel,initrd,kernel.cmdline},packages.txt,MANIFEST}
 # Engine: CPVM_ENGINE (default podman, rootless; docker where there is no podman).
 # OUT, DL default to the main checkout's .tmp (also from a worktree); DL (a dir
 # holding docker-26.1.4.tgz) is read only by static26.
@@ -9,7 +9,8 @@ repo=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-d
 OUT=${OUT:-$repo/.tmp/alp/out}
 name=$1 docker=${2:-apk} lima=0
 [ "${3:-}" != lima ] || lima=1
-ctrd=0; [ "${4:-}" != ctrd ] || ctrd=1
+# ctrd: default with lima (its stop is 1 s shorter), "-" for the default
+case ${4:--} in ctrd) ctrd=1 ;; -) ctrd=$lima ;; *) ctrd=0 ;; esac
 verity=0; [ "${5:-}" != verity ] || verity=1
 engine=${CPVM_ENGINE:-podman}
 command -v "$engine" >/dev/null || [ -n "${CPVM_ENGINE:-}" ] || engine=docker

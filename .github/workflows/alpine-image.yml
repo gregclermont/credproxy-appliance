@@ -56,11 +56,11 @@ jobs:
           docker version --format '{{.Server.Version}} {{.Server.Arch}}'
 
       # The variant measured end to end: Alpine's Docker, Lima's needs, dm-verity.
-      - name: Build (spike/alpine/build.sh ci apk lima noctrd verity)
+      - name: Build (spike/alpine/build.sh ci apk lima ctrd verity)
         env:
           CPVM_ENGINE: docker
         run: |
-          OUT=$RUNNER_TEMP/out spike/alpine/build.sh ci apk lima noctrd verity
+          OUT=$RUNNER_TEMP/out spike/alpine/build.sh ci apk lima ctrd verity
 
       - name: Report
         run: |

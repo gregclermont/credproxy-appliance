@@ -10,7 +10,7 @@ without it the root is a plain erofs and appliance dirs built that way carry a
 `roothash=` placeholder for credproxy's check), no reproducibility, arm64 built and smoke-booted in CI only, no update story, Lima integration only
 as far as the end-to-end measurement needed.
 
-## Image (`build.sh NAME [apk|static26] [lima|nolima] [ctrd]`)
+## Image (`build.sh NAME [apk|static26] [lima|nolima] [ctrd|noctrd|-] [verity]`)
 
 Rootless: `podman run alpine:3.23` (pinned digest) runs `mkimage.sh`, which
 assembles the root with `apk --root`, writes it as erofs (lz4hc, as the
@@ -30,14 +30,17 @@ days, smoke boot and verity tamper boots under QEMU with
   `10-alpine-prep.sh` enables, with a power-button script), GNU
   tar/coreutils/grep/findutils (credproxy's guest commands), rsync (else
   Lima's `30-install-packages.sh` installs it every boot); no probe. Used
-  for the end-to-end runs.
+  for the end-to-end runs. The power-button script marks
+  `/run/cpvm-poweroff` so that shutdown powers off at once (below).
 - `verity`: `cpvm.raw` = GPT root + root-verity hash partition
   (`veritysetup format` on files), `roothash=` on the cmdline; the
   initramfs reads the hash superblock and loads the dm-verity table with
   `dmsetup.static`, `panic_on_corruption`; any initramfs failure crashes
   the kernel (sysrq) so credproxy sees a panic.
 - `ctrd`: containerd as its own OpenRC service (`ctrd/`), dockerd pointed
-  at it; for the Docker 26 vs 29 comparison.
+  at it; for the Docker 26 vs 29 comparison. The default with `lima`
+  (`-` or no fourth argument): dockerd 29's managed containerd adds 1.0 s
+  to its stop. `noctrd` keeps the managed one.
 
 Boot: kernel -> initramfs (insmod virtio_blk, erofs, overlay; erofs root
 read-only under a tmpfs overlay, as `systemd.volatile=overlay`) ->
@@ -52,6 +55,15 @@ read-only under a tmpfs overlay, as `systemd.volatile=overlay`) ->
   `cpstate-setup`), `cpnet` (udhcpc in the background: `net` is provided
   before the lease, as networkd's `network.target`), `lima-init` (port of
   the mkosi one, minus systemd parts), sshd, docker.
+- Shutdown: busybox init runs `openrc shutdown`, then
+  `/usr/libexec/cpvm/cpshutdown` (its last `::shutdown:` action):
+  SIGTERM to all, wait while processes remain (at most 1 s), SIGKILL,
+  unmount everything but `/`, `/proc`, `/sys`, `/dev` and host-backed
+  shares (remount read-only what will not unmount), so the state disk's
+  ext4 ends clean; after the power button (Lima's stop) `poweroff -f`
+  at once, otherwise busybox's own path (1 s + 1 s of fixed sleeps) and
+  syscall (`reboot`, `halt`, a typed `poweroff`). Without it busybox
+  unmounted nothing (journal recovery on every boot) and slept 2 s.
 - No device manager (no udev/mdev): devtmpfs nodes, an explicit virtio
   module list. No getty except one on hvc0, no syslog, no ntp, no acpid
   (except with `lima`).

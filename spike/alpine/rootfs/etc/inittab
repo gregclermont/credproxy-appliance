@@ -3,3 +3,4 @@
 ::wait:/sbin/openrc default
 hvc0::respawn:/sbin/getty -L 0 hvc0 vt100
 ::shutdown:/sbin/openrc shutdown
+::shutdown:/usr/libexec/cpvm/cpshutdown

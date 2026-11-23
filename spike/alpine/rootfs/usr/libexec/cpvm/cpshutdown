@@ -1,0 +1,38 @@
+#!/bin/sh
+# busybox init's last ::shutdown: action, after `openrc shutdown`. Left to
+# itself, busybox then sends SIGTERM to all, sleeps 1 s, sends SIGKILL, sleeps
+# 1 s more and calls reboot() without unmounting anything. Here: SIGTERM, wait
+# only while processes remain (at most 1 s), SIGKILL, unmount (the state
+# disk's ext4 ends clean), and when the power button asked for it (acpi/PWRF)
+# power off at once; otherwise busybox goes on with its own path and syscall.
+alive() {
+	for p in /proc/[0-9]*; do
+		n=${p#/proc/}
+		{ [ "$n" = 1 ] || [ "$n" = $$ ]; } && continue
+		[ -e "$p/exe" ] && return 0
+	done
+	return 1
+}
+# centiseconds of uptime (always two decimals in /proc/uptime)
+now() { read -r u _ </proc/uptime; t=$((${u%.*} * 100 + 1${u#*.} - 100)); }
+waitgone() {
+	now; end=$((t + $1)); i=0
+	while alive && [ $t -lt $end ] && [ $i -lt 500 ]; do sleep 0.01; i=$((i + 1)); now; done
+}
+off=; [ ! -e /run/cpvm-poweroff ] || off=1
+t0=$(cut -d' ' -f1 /proc/uptime)
+kill -s TERM -1 2>/dev/null
+waitgone 100; w1=$i
+kill -s KILL -1 2>/dev/null
+waitgone 50; w2=$i
+sync
+# host-backed filesystems (shared folders) have nothing to make clean, and an
+# unmount waits on their backend
+awk '$3 !~ /^(virtiofs|9p|fuse.*|nfs.*|cifs|smb3)$/ {print $2}' /proc/mounts | sort -r |
+	while read -r m; do
+		case $m in /|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*) continue ;; esac
+		umount "$m" 2>/dev/null || mount -o remount,ro "$m" 2>/dev/null ||
+			echo "cpshutdown: $m stays mounted" >/dev/console
+	done
+echo "cpshutdown: done in $t0 -> $(cut -d' ' -f1 /proc/uptime) s (wait loops: $w1 $w2)" >/dev/console
+[ -z "$off" ] || poweroff -f
