@@ -1,0 +1,11 @@
+#!/sbin/openrc-run
+# DHCP on eth0 without waiting for the lease, as systemd-networkd does
+# (network.target does not wait for it either).
+description="DHCP on eth0"
+command=/sbin/udhcpc
+# -O mtu: credproxyd hands out a 65520-byte MTU (as networkd UseMTU=yes)
+command_args="-f -S -O mtu -i eth0"
+command_background=yes
+pidfile=/run/udhcpc.eth0.pid
+depend() { need cphw; provide net; }
+start_pre() { ip link set lo up; ip link set eth0 up; }

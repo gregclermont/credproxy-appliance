@@ -1,0 +1,50 @@
+credproxy appliance images
+Copyright 2026 Grégoire Clermont
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This repository adapts material from the following projects.
+
+Lima (https://github.com/lima-vm/lima)
+Copyright The Lima Authors
+Licensed under the Apache License, Version 2.0.
+
+  Files that reproduce what Lima's guest boot scripts and guest agent write,
+  so that those scripts find them up to date at boot. Some must stay
+  byte-identical to Lima's output, so they carry no notice of their own:
+    spike/mkosi/mkosi.extra/etc/systemd/system/lima-guestagent.service
+      (Lima's lima-guestagent.TEMPLATE.service, rendered)
+    spike/mkosi/mkosi.extra/etc/sysctl.d/99-lima.conf
+    spike/alpine/rootfs/etc/sysctl.d/99-lima.conf
+      (the lines Lima's 20-rootless-base.sh writes)
+    spike/mkosi/mkosi.extra/etc/systemd/system/user@.service.d/lima.conf
+      (20-rootless-base.sh)
+    spike/mkosi/mkosi.extra/etc/systemd/resolved.conf.d/00-lima-enable-mdns.conf
+      (06-enable-mdns-on-systemd.sh)
+    spike/mkosi/mkosi.extra/etc/ssh/sshd_config.d/10-acceptenv-colorterm.conf
+    spike/alpine/rootfs/etc/ssh/sshd_config.d/10-acceptenv-colorterm.conf
+      (11-colorterm-environment.sh)
+  The kernel module list of Lima's 00-modprobe.sh, in
+    spike/mkosi/mkosi.extra/usr/lib/systemd/system/lima-modules.service
+    spike/nixos/lima.nix
+    spike/alpine/rootfs/etc/init.d/cpmodules
+  lima-init (spike/mkosi/mkosi.extra/usr/libexec/lima-init and its Alpine
+  port) reimplements, without cloud-init, the parts of Lima's cloud-init
+  user-data these images need, after the approach of Lima's WSL2 driver
+  (pkg/driver/wsl2/boot.Linux/02-no-cloud-init-setup.sh), and the
+  /etc/environment handling of Lima's 07-etc-environment.sh.
+
+mkosi (https://github.com/systemd/mkosi)
+Licensed under the GNU Lesser General Public License, version 2.1 or later.
+
+  spike/mkosi/initrd/mkosi.conf starts from mkosi's default initrd
+  configuration (mkosi-initrd), with packages and files removed.
+
+Moby / Docker (https://github.com/moby/moby)
+Docker
+Copyright 2012-2017 Docker, Inc.
+Licensed under the Apache License, Version 2.0.
+
+  The containerd and Docker systemd units in spike/nixos/docker.nix follow
+  the units Debian's docker.io package ships, which come from Moby's
+  contrib/init/systemd.

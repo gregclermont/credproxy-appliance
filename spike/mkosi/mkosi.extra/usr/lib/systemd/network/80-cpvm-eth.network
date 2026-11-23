@@ -1,0 +1,20 @@
+# Lima's network-config (cloud-init would render it each boot): DHCP on the
+# NIC, named eth0 via net.ifnames=0 on the kernel cmdline.
+[Match]
+Name=eth*
+
+[Network]
+DHCP=ipv4
+# credproxy's bootstrap name: resolved sends *.local to mDNS only, unless a
+# link routes the domain to unicast DNS (our netstack answers it). A
+# routing-only domain makes resolved drop the link as default DNS route
+# unless DNSDefaultRoute says otherwise (found on a real VM: all other
+# lookups failed).
+Domains=~proxy.local
+DNSDefaultRoute=yes
+
+[DHCPv4]
+RouteMetric=200
+# credproxyd hands out a 65520-byte MTU on QEMU's stream link (per-frame
+# costs dominate throughput through a userspace netstack); 1500 on VZ.
+UseMTU=yes

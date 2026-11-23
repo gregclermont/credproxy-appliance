@@ -1,0 +1,180 @@
+name: nixos-image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - spike/nixos/**
+      - spike/mkosi/**
+      - .github/workflows/nixos-image.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nixos-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Runner
+        run: |
+          echo "OUT=$RUNNER_TEMP/out" >>"$GITHUB_ENV"
+          echo "REPORT=$RUNNER_TEMP/report" >>"$GITHUB_ENV"
+          command -v zstd >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq zstd; }
+          uname -a
+          nproc; free -h; df -h / "$RUNNER_TEMP"
+          ls -l /dev/kvm || echo "no /dev/kvm"
+          docker version --format '{{.Server.Version}} {{.Server.Arch}}'
+
+      - name: Build (spike/nixos/build.sh)
+        env:
+          CPVM_ENGINE: docker
+        run: |
+          start=$(date +%s)
+          spike/nixos/build.sh "$OUT"
+          echo "BUILD_SECONDS=$(($(date +%s) - start))" >>"$GITHUB_ENV"
+
+      - name: Report
+        run: |
+          mkdir -p "$REPORT"
+          cp "$OUT"/MANIFEST "$OUT"/closure-top.txt "$OUT"/closure-self.txt "$OUT"/dkb/kernel.cmdline "$REPORT"/
+          zstd -19 -T0 -q -o "$OUT/cpvm.raw.zst" "$OUT/cpvm.raw"
+          (cd "$OUT" && sha256sum cpvm.raw cpvm.raw.zst dkb/*) >"$REPORT/sha256sums.txt"
+          file -L "$OUT"/dkb/kernel "$OUT"/dkb/initrd >"$REPORT/kernel-file.txt"
+          # The modules tree in the image against the kernel's full one: what
+          # vm-modules.sh dropped on this architecture, and what is built in.
+          top=$(sed -n 's/^toplevel: //p' "$OUT/MANIFEST")
+          docker run --rm -v cpv2-nix-store:/nix \
+            docker.io/nixos/nix@sha256:746280551ddc1c72177d1a597c05eacac86dfaa18d5d649bf86411278bcd5470 \
+            bash -euc '
+              tag() { while IFS= read -r l; do echo "$1 $l"; done; }
+              kept=$(readlink -f "$1/kernel-modules/lib/modules"/*)
+              ver=${kept##*/}
+              # the modules output of the kernel: the largest tree of that version
+              full=$(wc -l /nix/store/*-linux-*-modules/lib/modules/"$ver"/modules.dep | grep -v " total$" | sort -n | tail -1)
+              full=${full##* }; full=${full%/modules.dep}
+              echo "== kept: $kept"; cut -d: -f1 "$kept/modules.dep" | sort
+              echo "== dropped (full: $full)"
+              comm -23 <(cut -d: -f1 "$full/modules.dep" | sort) <(cut -d: -f1 "$kept/modules.dep" | sort) | tag D
+              echo "== builtin"; tag B <"$full/modules.builtin"
+            ' bash "$top" >"$REPORT/modules.txt"
+          raw=$(stat -c %s "$OUT/cpvm.raw"); zst=$(stat -c %s "$OUT/cpvm.raw.zst")
+          mib() { echo "$(( ($1 + 524288) / 1048576 )) MiB"; }
+          virt='virtio|amba|pl0[0-9][0-9]|gpio[-_]keys|psci|irq-gic|8250|vsock|balloon|/9p/|fuse|kvm|rtc'
+          {
+            echo "## ${{ matrix.arch }} on ${{ matrix.runner }}"
+            echo
+            echo "build.sh wall time: ${BUILD_SECONDS} s"
+            echo
+            echo "| | bytes | |"
+            echo "|---|---|---|"
+            echo "| cpvm.raw | $raw | $(mib "$raw") |"
+            echo "| cpvm.raw.zst (-19) | $zst | $(mib "$zst") |"
+            echo "| dkb/kernel | $(stat -c %s "$OUT/dkb/kernel") | |"
+            echo "| dkb/initrd | $(stat -c %s "$OUT/dkb/initrd") | |"
+            echo
+            echo '```'; cat "$OUT/MANIFEST"; echo '```'
+            echo
+            echo '```'; cat "$REPORT/kernel-file.txt"; echo '```'
+            echo
+            echo "### closure (top 25, cumulative)"
+            echo '```'; cat "$OUT/closure-top.txt"; echo '```'
+            echo
+            echo "### modules: $(grep -c '^D ' "$REPORT/modules.txt") dropped, virt-relevant ones dropped / built in"
+            echo '```'; grep -E '^[DB] ' "$REPORT/modules.txt" | grep -Ei "$virt" || true; echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: nixos-report-${{ matrix.arch }}
+          path: ${{ runner.temp }}/report
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nixos-image-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/out/cpvm.raw.zst
+            ${{ runner.temp }}/out/dkb/
+          retention-days: 3
+          compression-level: 0
+
+      # Direct kernel boot as Lima does it, without Lima: no cidata and no
+      # state disk, so lima-init fails after waiting 90 s for cidata.
+      - name: Boot smoke test
+        continue-on-error: true
+        timeout-minutes: 20
+        run: |
+          sudo apt-get update -qq
+          if [ "${{ matrix.arch }}" = aarch64 ]; then
+            sudo apt-get install -y -qq --no-install-recommends qemu-system-arm >/dev/null
+          else
+            sudo apt-get install -y -qq --no-install-recommends qemu-system-x86 >/dev/null
+          fi
+          if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; fi
+          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then accel=kvm; else accel=tcg; fi
+          if [ "${{ matrix.arch }}" = aarch64 ]; then
+            qemu=qemu-system-aarch64 machine=virt early=earlycon
+            [ $accel = kvm ] && cpu=host || cpu=max,pauth-impdef=on
+            wait=900
+          else
+            qemu=qemu-system-x86_64 machine=q35 early=earlycon=uart8250,io,0x3f8
+            [ $accel = kvm ] && cpu=host || cpu=max
+            wait=300
+          fi
+          echo "accel: $accel" | tee -a "$GITHUB_STEP_SUMMARY"
+          log=$REPORT/serial-hvc0.log early_log=$REPORT/serial-early.log
+          : >"$log"
+          start=$(date +%s)
+          $qemu -machine $machine,accel=$accel -cpu $cpu -smp 2 -m 2048 \
+            -display none -monitor none -no-reboot \
+            -kernel "$OUT/dkb/kernel" -initrd "$OUT/dkb/initrd" \
+            -append "$(cat "$OUT/dkb/kernel.cmdline") $early keep_bootcon" \
+            -drive if=none,id=img,file="$OUT/cpvm.raw",format=raw,readonly=on -device virtio-blk-pci,drive=img \
+            -netdev user,id=n0 -device virtio-net-pci,netdev=n0,romfile= \
+            -device virtio-serial-pci -chardev file,id=hvc,path="$log" -device virtconsole,chardev=hvc \
+            -serial file:"$early_log" &
+          pid=$!
+          result=timeout
+          while [ $(($(date +%s) - start)) -lt $wait ]; do
+            if ! kill -0 $pid 2>/dev/null; then result=exited; break; fi
+            if grep -qE 'Reached target .*Multi-User System' "$log"; then
+              grep -q 'Mounted .*/sysroot/nix/store' "$log" && result=pass || result=no-store-mount
+              break
+            fi
+            sleep 2
+          done
+          elapsed=$(($(date +%s) - start))
+          kill $pid 2>/dev/null || true; wait $pid 2>/dev/null || true
+          {
+            echo "### boot smoke: $result after ${elapsed} s ($accel)"
+            echo '```'
+            grep -aE 'verity|Integrity Protection|/sysroot/nix/store|Switching root|SSH Daemon|sshd|Multi-User|FAILED|Failed to start|Kernel panic' "$log" "$early_log" | head -60 || true
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          [ $result = pass ]
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: nixos-boot-${{ matrix.arch }}
+          path: ${{ runner.temp }}/report/serial-*.log
+          if-no-files-found: ignore

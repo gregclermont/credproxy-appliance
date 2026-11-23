@@ -1,0 +1,11 @@
+#!/sbin/openrc-run
+# busybox acpid without busybox-openrc's dependencies (localmount, fsck): the
+# power button is how Lima stops a QEMU guest (QMP system_powerdown).
+# Lima's 10-alpine-prep.sh enables and starts it.
+description="ACPI power button (busybox acpid)"
+command=/sbin/acpid
+command_args="-f"
+command_background=yes
+pidfile=/run/acpid.pid
+depend() { need dev; }
+start_pre() { modprobe -a button evdev 2>/dev/null; return 0; }

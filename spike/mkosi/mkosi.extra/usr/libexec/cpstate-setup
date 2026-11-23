@@ -1,0 +1,59 @@
+#!/bin/sh
+# Mount the workspace state disk (Lima additionalDisks entry "cpstate") early,
+# formatting it on first use, and bind its directories over the ephemeral root.
+# Label follows Lima's convention (lima-<name>, GPT partition 1) so Lima's own
+# 05-lima-disks.sh finds it formatted and only adds a second mount at
+# /mnt/lima-cpstate.
+set -eu
+label=lima-cpstate
+state=/var/lib/cpstate
+
+# sshd's host key lives here (sshd_config.d/10-cpvm-hostkey.conf), not in the
+# image: every VM booting the image would otherwise share one private key.
+# Without a state disk it is on the ephemeral root, new each boot.
+hostkey() {
+    mkdir -p -m 700 "$state/ssh"
+    [ -s "$state/ssh/ssh_host_ed25519_key" ] ||
+        ssh-keygen -q -t ed25519 -N '' -C '' -f "$state/ssh/ssh_host_ed25519_key"
+}
+
+# Pick the disk by content, not name (Lima's order isn't fixed: on VZ with one
+# additional disk it is vda = image, vdb = state, vdc = cidata). Already
+# formatted: find it by label (blkid probes the devices itself, and the kernel
+# created the nodes in the initrd: no need to wait for udev, ~0.4 s saved).
+# First use: the only blank virtio disk.
+if part=$(blkid -L "$label" 2>/dev/null); then
+    :
+else
+    udevadm settle
+    blank=""
+    for d in /sys/block/vd*; do
+        dev=/dev/${d##*/}
+        # anything blkid recognises (partition table, filesystem, cidata iso) is not ours
+        blkid -p "$dev" >/dev/null 2>&1 && continue
+        blank="$blank $dev"
+    done
+    set -- $blank
+    if [ $# -eq 0 ]; then
+        echo "cpstate: no state disk, home stays ephemeral" >&2
+        hostkey
+        exit 0
+    elif [ $# -gt 1 ]; then
+        echo "cpstate: several blank disks ($*), refusing to pick one" >&2
+        exit 1
+    fi
+    echo "cpstate: first use, formatting $1" >&2
+    echo 'type=linux' | sfdisk -q --label gpt "$1"
+    udevadm settle
+    part=${1}1
+    mkfs.ext4 -q -L "$label" "$part"
+    udevadm settle
+fi
+
+mkdir -p "$state"
+mount -o noatime "$part" "$state"
+mkdir -p "$state/home" "$state/docker"
+mount --bind "$state/home" /home
+mkdir -p /var/lib/docker
+mount --bind "$state/docker" /var/lib/docker
+hostkey

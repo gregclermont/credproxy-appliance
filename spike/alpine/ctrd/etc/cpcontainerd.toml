@@ -1,0 +1,3 @@
+version = 2
+# as dockerd's managed containerd: no CRI
+disabled_plugins = ["io.containerd.grpc.v1.cri"]

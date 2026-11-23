@@ -1,0 +1,3 @@
+#!/bin/sh
+# credproxyd hands out a 65520-byte MTU; Alpine's default.script ignores option 26
+[ -z "$mtu" ] || ip link set dev "$interface" mtu "$mtu"

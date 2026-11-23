@@ -1,0 +1,21 @@
+#!/sbin/openrc-run
+# containerd as its own service, dockerd pointed at it (as Debian's
+# containerd.service): dockerd 26's managed containerd costs ~1 s at start
+# (its first dial to the new containerd waits out a 1 s backoff). Same root
+# and state as the managed one, so the state disk's data is found either way;
+# its own config (Alpine's is containerd 2's format, which 1.7 rejects).
+description="containerd"
+command=/usr/bin/containerd
+command_args="--config /etc/cpcontainerd.toml --root /var/lib/docker/containerd/daemon --state /run/docker/containerd/daemon"
+command_background=yes
+pidfile=/run/cpcontainerd.pid
+output_log=/var/log/containerd.log
+error_log=/var/log/containerd.log
+depend() { need cpstate; }
+start_post() {
+	n=0
+	until [ -S /run/containerd/containerd.sock ]; do
+		n=$((n + 1)); [ $n -lt 500 ] || return 1
+		sleep 0.01
+	done
+}

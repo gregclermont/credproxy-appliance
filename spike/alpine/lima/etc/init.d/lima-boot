@@ -1,0 +1,10 @@
+#!/sbin/openrc-run
+# As the mkosi image's lima-boot.service: Lima's per-boot scripts from cidata,
+# after Docker so that they do not compete with its start.
+description="Lima boot scripts (cidata boot.sh)"
+depend() { need lima-init; after docker sshd; }
+start() {
+	ebegin "Running Lima's boot.sh"
+	LIMA_CIDATA_MNT=/mnt/lima-cidata nice -n 10 /mnt/lima-cidata/boot.sh >/var/log/lima-boot.log 2>&1
+	eend $?
+}

@@ -1,0 +1,20 @@
+[Unit]
+Description=Lima boot scripts (cidata boot.sh, cloud-init per-boot in stock images)
+Requires=lima-init.service
+After=lima-init.service systemd-resolved.service network.target docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=LIMA_CIDATA_MNT=/mnt/lima-cidata
+ExecStart=/mnt/lima-cidata/boot.sh
+# Nothing on a workspace's start path waits for boot.sh any more (lima-init
+# does what ssh and Lima's socket forwards need), but its ~1.5 s of work
+# overlaps dockerd's start, which the first guest command does wait for:
+# ordered after it (its daemon-reload alone holds PID 1 ~0.2 s).
+Nice=10
+CPUWeight=20
+IOWeight=20
+
+[Install]
+WantedBy=multi-user.target

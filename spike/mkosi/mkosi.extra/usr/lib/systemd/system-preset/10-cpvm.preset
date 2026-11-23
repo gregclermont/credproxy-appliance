@@ -1,0 +1,24 @@
+# mkosi runs `systemctl preset-all` after mkosi.postinst.chroot, so enable/disable
+# choices that must stick go here. First match wins.
+# Docker starts with the boot, in parallel: credproxy's readiness is the guest's
+# sshd, not Lima's READY, and its first guest command is a docker call, which
+# would otherwise wait for socket activation (3-6 s, up to 17 s on a cold first
+# boot, 2026-11-21).
+enable docker.service
+enable containerd.service
+enable docker.socket
+enable cpvm-prefetch.service
+# Lima provisioning without cloud-init (lima-init + lima-boot)
+enable lima-init.service
+enable lima-boot.service
+enable lima-modules.service
+enable lima-guestagent.service
+# not needed in a workspace VM with an ephemeral root
+disable systemd-networkd-wait-online.service
+disable e2scrub_reap.service
+disable e2scrub_all.timer
+disable fstrim.timer
+disable dpkg-db-backup.timer
+disable systemd-pstore.service
+disable systemd-pcrlock-*
+disable getty@.service

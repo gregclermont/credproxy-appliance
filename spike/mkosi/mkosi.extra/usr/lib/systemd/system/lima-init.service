@@ -1,0 +1,12 @@
+[Unit]
+Description=Lima user and SSH key from cidata (replaces cloud-init)
+After=local-fs.target systemd-logind.service
+Before=ssh.service systemd-user-sessions.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/lima-init
+
+[Install]
+WantedBy=multi-user.target

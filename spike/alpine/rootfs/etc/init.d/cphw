@@ -1,0 +1,7 @@
+#!/sbin/openrc-run
+# No device manager: the hardware is QEMU/VZ's fixed set of virtio devices.
+description="Drivers for the VM's devices"
+# provides dev: what udev/mdev provide, which acpid needs
+depend() { after devfs; provide dev; }
+# vmw_vsock_virtio_transport: VZ's vsock (Lima's guest agent, time sync); in sysinit, so before lima-guestagent
+start() { modprobe -a virtio_net virtio_rng virtio_balloon virtio_scsi sr_mod isofs ext4 button vmw_vsock_virtio_transport 2>/dev/null; return 0; }

@@ -1,0 +1,22 @@
+# Boot the mkosi-built appliance image under Lima (VZ). Default network first
+# (provisioning test); switch to `lima: cp` for boot timing.
+minimumLimaVersion: 2.0.0
+vmType: vz
+os: Linux
+arch: x86_64
+images:
+# default build output; another one with --set '.images[0].location="…"'
+- location: ~/src/credproxy-appliance/.tmp/mkosi-out/cpvm.raw
+  arch: x86_64
+cpus: 2
+memory: 2GiB
+disk: 20GiB
+mounts: []
+containerd:
+  system: false
+  user: false
+# workspace state (home, Docker data): formatted + mounted by the image's
+# cpstate.service; create once with `limactl disk create cpstate --size 10GiB --format raw`
+additionalDisks:
+- name: cpstate
+  format: false

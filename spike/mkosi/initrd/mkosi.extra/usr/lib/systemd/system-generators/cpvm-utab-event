@@ -1,0 +1,14 @@
+#!/bin/sh
+# Give PID 1's mount monitor a file to watch instead of all of /run.
+# systemd watches libmount's utab through inotify on /run/mount/utab.event;
+# while that file does not exist, libmount watches the nearest existing parent
+# directory for IN_CREATE instead, i.e. /run itself. Every file or directory
+# created in /run (udev, log, initctl, tmpfiles...) then wakes PID 1's
+# mount-event source and counts against its rate limit (5 dispatches/s); once
+# over it, systemd holds back every mount job, sysroot.mount included, until the
+# 1 s window ends: a ~0.65 s initrd stall in about half the boots. Generators
+# run before the monitor is set up. /run moves to the real root, so the main
+# system's PID 1 finds the file too. libmount itself creates it on the first
+# utab update and only ever closes it after writing (the event).
+[ -e /run/mount/utab.event ] && exit 0
+mkdir -p -m 0755 /run/mount && : >> /run/mount/utab.event

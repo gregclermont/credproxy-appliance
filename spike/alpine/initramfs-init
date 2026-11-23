@@ -1,0 +1,57 @@
+#!/bin/sh
+# Root = erofs, read-only, under a tmpfs overlay (as the mkosi image's
+# systemd.volatile=overlay). With a hex roothash= on the cmdline: the erofs
+# is /dev/vda1, opened through dm-verity with /dev/vda2 as the hash device
+# (veritysetup's on-disk format: superblock in block 0, tree from block 1),
+# panic_on_corruption. Without one: the erofs is /dev/vda, unverified.
+/bin/busybox --install -s /bin
+mount -t devtmpfs dev /dev
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+exec </dev/console >/dev/console 2>&1
+# fail closed and visibly: credproxy watches the console for "Kernel panic"
+fail() { echo "initramfs: $*"; echo 1 >/proc/sys/kernel/sysrq; echo c >/proc/sysrq-trigger; }
+while read -r m; do insmod /lib/modules/$m || fail "insmod $m"; done </modules
+waitdev() {
+	n=0
+	until [ -b "$1" ]; do
+		n=$((n + 1)); [ $n -lt 500 ] || fail "no $1"
+		usleep 10000
+	done
+}
+rh=
+for a in $(cat /proc/cmdline); do
+	case $a in roothash=*) rh=${a#roothash=} ;; esac
+done
+case $rh in
+*[!0-9a-f]* | "") rh= ;;
+esac
+if [ ${#rh} = 64 ]; then
+	waitdev /dev/vda1; waitdev /dev/vda2
+	h=/dev/vda2
+	# superblock fields (struct verity_sb): the root hash commits to the
+	# tree they describe, so a wrong value fails verification, not opens
+	[ "$(head -c 6 $h)" = verity ] || fail "no verity superblock on $h"
+	alg=$(head -c 64 $h | tail -c 32 | tr -d '\0')
+	dbs=$(od -A n -t u4 -j 64 -N 4 $h | tr -d ' ')
+	hbs=$(od -A n -t u4 -j 68 -N 4 $h | tr -d ' ')
+	nb=$(od -A n -t u8 -j 72 -N 8 $h | tr -d ' ')
+	sl=$(od -A n -t u2 -j 80 -N 2 $h | tr -d ' ')
+	salt=$(od -A n -t x1 -j 88 -N "$sl" $h | tr -d ' \n')
+	[ "$alg" = sha256 ] && [ "$dbs" = 4096 ] && [ "$hbs" = 4096 ] || fail "unexpected verity parameters"
+	dmsetup create --readonly --noudevsync root --table \
+		"0 $((nb * 8)) verity 1 /dev/vda1 $h 4096 4096 $nb 1 sha256 $rh ${salt:--} 1 panic_on_corruption" ||
+		fail "dm-verity"
+	waitdev /dev/dm-0
+	mount -t erofs -o ro /dev/dm-0 /lower || fail "mount root"
+else
+	waitdev /dev/vda
+	mount -t erofs -o ro /dev/vda /lower || fail "mount root"
+fi
+mount -t tmpfs -o mode=0755 rw /rw
+mkdir -p /rw/upper /rw/work
+mount -t overlay -o lowerdir=/lower,upperdir=/rw/upper,workdir=/rw/work root /newroot || fail "overlay"
+read -r up _ </proc/uptime
+for d in dev proc sys; do mount --move /$d /newroot/$d; done
+echo "@@cpm $up switch"
+exec switch_root /newroot /sbin/init

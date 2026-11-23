@@ -1,0 +1,3 @@
+DOCKER_OPTS=""
+LOGPROXY_CHMOD=0644
+rc_need="cpstate"

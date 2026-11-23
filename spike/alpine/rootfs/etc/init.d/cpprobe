@@ -1,0 +1,6 @@
+#!/sbin/openrc-run
+description="Boot milestones on the console (measurement only)"
+command=/usr/libexec/cpvm/probe
+command_background=yes
+pidfile=/run/cpprobe.pid
+depend() { after devfs; }

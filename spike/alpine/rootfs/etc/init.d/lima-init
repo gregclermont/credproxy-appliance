@@ -1,0 +1,4 @@
+#!/sbin/openrc-run
+description="Lima user and SSH key from cidata"
+depend() { need cphw cpstate; }
+start() { /usr/libexec/cpvm/lima-init; }

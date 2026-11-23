@@ -1,0 +1,50 @@
+#!/bin/sh
+# spike/mkosi's lima-init for OpenRC (no systemd: no guest agent unit, no
+# linger): the user, its key and the cidata mount. Lima's boot.sh runs from
+# the lima-boot service (the `lima` variant), not here.
+set -eu
+mnt=/mnt/lima-cidata
+mkdir -p -m 700 "$mnt"
+if ! mountpoint -q "$mnt"; then
+	dev=$(blkid -L cidata)
+	mount -t iso9660 -o ro,mode=0700,dmode=0700,overriderockperm,exec,uid=0 "$dev" "$mnt"
+fi
+ud=$mnt/user-data
+# shellcheck disable=SC2163
+while read -r line; do [ -n "$line" ] && export "$line"; done <"$mnt/lima.env"
+
+h=$(sed -n 's/^local-hostname: *//p' "$mnt/meta-data")
+[ -z "$h" ] || { echo "$h" >/etc/hostname; hostname "$h"; }
+tz=$(sed -n 's/^timezone: *//p' "$ud")
+[ -z "$tz" ] || [ ! -e "/usr/share/zoneinfo/$tz" ] || ln -sf "/usr/share/zoneinfo/$tz" /etc/localtime
+
+u=$LIMA_CIDATA_USER home=$LIMA_CIDATA_HOME
+if ! id "$u" >/dev/null 2>&1; then
+	m=-m
+	[ ! -d "$home" ] || m=-M
+	useradd -u "$LIMA_CIDATA_UID" -c "$LIMA_CIDATA_COMMENT" -d "$home" -s "$LIMA_CIDATA_SHELL" $m "$u"
+fi
+# sshd without PAM refuses locked accounts ("!"): no password, but not locked
+usermod -p '*' -aG docker "$u"
+if [ "$LIMA_CIDATA_PASSWORDLESS_SUDO" = 1 ]; then
+	echo "$u ALL=(ALL) NOPASSWD:ALL" >/etc/sudoers.d/90-lima-users
+else
+	echo "$u ALL=(ALL) ALL" >/etc/sudoers.d/90-lima-users
+fi
+install -d -m 700 -o "$u" -g "$(id -g "$u")" "$home/.ssh"
+sed -n '/^ *ssh[-_]authorized[-_]keys:/,/^ *[^ -]/{s/^ *- *"\(.*\)"$/\1/p}' "$ud" >"$home/.ssh/authorized_keys"
+chown "$u:$(id -g "$u")" "$home/.ssh/authorized_keys"
+chmod 600 "$home/.ssh/authorized_keys"
+
+tab=$(printf '\t')
+sed -n '/^mounts:/,/^[^ -]/{s/^- *\[\(.*\)\]$/\1/p}' "$ud" | tr -d '"' | sed "s/, /$tab/g" |
+	while IFS=$tab read -r tag mp type opts _; do
+		mkdir -p "$mp"
+		mountpoint -q "$mp" || mount -t "$type" -o "$opts" "$tag" "$mp" || echo "lima-init: mount $tag on $mp failed" >&2
+	done
+
+etcenv=/etc/environment
+[ ! -e "$etcenv" ] || sed -i '/#LIMA-START/,/#LIMA-END/d' "$etcenv"
+cat "$mnt/etc_environment" >>"$etcenv"
+: >/run/credproxy-ssh-stable
+echo "$LIMA_CIDATA_IID" >/run/lima-ssh-ready

@@ -1,0 +1,4 @@
+# /dev/kvm usable by any user in the guest: a workspace container passes it
+# with only `--device /dev/kvm` (no `--group-add kvm`), whatever its user.
+# The VM is the boundary. After Debian's 0660 root:kvm rule (50-udev-default).
+KERNEL=="kvm", MODE="0666"

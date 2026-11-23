@@ -1,0 +1,30 @@
+# mkosi build VM (mkosi is Linux-only). Default Lima network.
+# vmType: Lima's default (vz on macOS, qemu on Linux). On Linux, override the
+# mount locations and memory (see README).
+minimumLimaVersion: 2.0.0
+base: template:_images/debian-13
+cpus: 4
+memory: 6GiB
+disk: 40GiB
+containerd:
+  system: false
+  user: false
+# Defaults for a checkout at ~/src/credproxy-appliance; set both with --set
+# (README) for any other checkout or output directory.
+mounts:
+- location: ~/src/credproxy-appliance/spike/mkosi
+  mountPoint: /src
+- location: ~/src/credproxy-appliance/.tmp/mkosi-out
+  mountPoint: /out
+  writable: true
+provision:
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux
+    command -v mkosi && exit 0
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends mkosi systemd-repart systemd-ukify systemd-boot-efi \
+      debian-archive-keyring apt dosfstools mtools e2fsprogs erofs-utils cryptsetup-bin \
+      squashfs-tools zstd qemu-utils python3-pefile sbsigntool openssl

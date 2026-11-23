@@ -1,0 +1,17 @@
+[Unit]
+Description=Kernel modules Lima's boot scripts load (00-modprobe.sh), early and in parallel
+# not via modules-load.d: systemd-modules-load is ordered before sysinit.target
+# and loading these took ~0.3 s on that path; here it overlaps the rest of boot
+# and Lima's own modprobe loop then finds them loaded.
+DefaultDependencies=no
+Before=lima-boot.service docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=-/usr/sbin/modprobe -a fuse tun tap bridge veth ip_tables ip6_tables iptable_nat ip6table_nat iptable_filter ip6table_filter nf_tables x_tables xt_MASQUERADE xt_addrtype xt_comment xt_conntrack xt_mark xt_multiport xt_nat xt_tcpudp overlay
+# not Lima's: dockerd loads it while setting up its bridge, on its start path
+ExecStart=-/usr/sbin/modprobe br_netfilter
+
+[Install]
+WantedBy=multi-user.target

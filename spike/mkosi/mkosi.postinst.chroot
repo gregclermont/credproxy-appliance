@@ -1,0 +1,43 @@
+#!/bin/sh
+set -eu
+# sshd as ssh.service only (stock Debian): with ssh.socket also on :22, Lima's
+# `systemctl reload ssh` kills the service ("Cannot bind any address"). Mask, not
+# disable: mkosi applies presets after this script. Lima reloads ssh.service
+# explicitly, so the service (not the socket) must be the one that stays.
+systemctl enable systemd-networkd systemd-resolved ssh.service
+systemctl mask ssh.socket
+systemctl enable cpstate.service
+# docker.io's postinst creates the group with the next free system gid; pin it.
+# groupmod fails (and so the build) if another group already holds the gid.
+old=$(getent group docker | cut -d: -f3)
+if [ "$old" != "$CPVM_DOCKER_GID" ]; then
+	groupmod -g "$CPVM_DOCKER_GID" docker
+	find / -xdev -gid "$old" -exec chgrp -h "$CPVM_DOCKER_GID" {} +
+fi
+# Per-boot work the ephemeral root would redo every boot for nothing: /etc and
+# /var start "un-updated" each boot (ConditionNeedsUpdate), and "first boot"
+# each boot (empty machine-id). The image already has these results.
+systemctl mask ldconfig.service systemd-journal-catalog-update.service \
+	systemd-update-done.service systemd-hwdb-update.service systemd-firstboot.service \
+	systemd-machine-id-commit.service systemd-binfmt.service
+# docker.service (enabled, started with the boot) wants network-online.target,
+# which would pull this in and hold dockerd ~2.5 s for nothing: dockerd needs
+# no network to start, pulls go through credproxy once eth0 has its lease.
+systemctl mask systemd-networkd-wait-online.service
+# Generators with nothing to do here; each also runs on every daemon-reload
+# (Lima's boot scripts do several).
+mkdir -p /etc/systemd/system-generators
+for g in gpt-auto hibernate-resume rc-local run system-update sysv tpm2; do
+	ln -sf /dev/null /etc/systemd/system-generators/systemd-$g-generator
+done
+# Lima's boot scripts expect these to exist (05-lima-mounts, 06-enable-mdns).
+touch /etc/fstab
+install -d /etc/systemd/resolved.conf.d
+# resolve our own hostname (sudo warns otherwise; Lima only adds host.lima.internal)
+sed -i 's/^hosts:.*/hosts:          files myhostname dns/' /etc/nsswitch.conf
+# The image ships no host key: cpstate-setup generates one on the state disk.
+# sshd reads only that one (sshd_config.d/10-cpvm-hostkey.conf), so the
+# RSA/ECDSA/ed25519 keys sshd-keygen would write to the volatile /etc/ssh on
+# every boot, before ssh.service, are never used.
+rm -f /etc/ssh/ssh_host_*
+systemctl mask sshd-keygen.service

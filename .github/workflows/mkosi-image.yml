@@ -1,0 +1,212 @@
+name: mkosi-image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - spike/mkosi/**
+      - .github/workflows/mkosi-image.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mkosi-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # debian:trixie (multi-arch index); mkosi at the version the builder VM
+  # (builder.yaml, Debian 13) installs
+  DEBIAN_IMAGE: docker.io/library/debian@sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6
+  MKOSI_VERSION: 25.3-7
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Runner
+        run: |
+          echo "OUT=$RUNNER_TEMP/out" >>"$GITHUB_ENV"
+          echo "REPORT=$RUNNER_TEMP/report" >>"$GITHUB_ENV"
+          command -v zstd >/dev/null && command -v sfdisk >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq zstd fdisk; }
+          uname -a
+          nproc; free -h; df -h / "$RUNNER_TEMP"
+          ls -l /dev/kvm || echo "no /dev/kvm"
+          docker version --format '{{.Server.Version}} {{.Server.Arch}}'
+
+      # build.sh as in the builder VM: the config at /src, outputs in /out,
+      # mkosi run as root through sudo, the work tree in ~/w. The work tree and
+      # mkosi's workspace (/var/tmp) are host directories, not the container's
+      # overlayfs. Privileges: mkosi sets up its own mount namespaces (bind
+      # mounts, tmpfs, proc) for every tool it runs, which needs CAP_SYS_ADMIN
+      # and the unshare/mount syscalls the default seccomp and AppArmor
+      # profiles refuse. No devices: repart builds the image offline, without
+      # loop devices.
+      - name: Build (spike/mkosi/build.sh in Debian 13)
+        run: |
+          mkdir -p "$OUT" "$RUNNER_TEMP/w" "$RUNNER_TEMP/vartmp"
+          start=$(date +%s)
+          docker run --rm \
+            --cap-add SYS_ADMIN --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+            -v "$GITHUB_WORKSPACE/spike/mkosi:/src:ro" -v "$OUT:/out" \
+            -v "$RUNNER_TEMP/w:/root/w" -v "$RUNNER_TEMP/vartmp:/var/tmp" \
+            -e MKOSI_VERSION \
+            "$DEBIAN_IMAGE" bash -euc '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends "mkosi=$MKOSI_VERSION" \
+                systemd-repart systemd-ukify systemd-boot-efi \
+                debian-archive-keyring apt dosfstools mtools e2fsprogs erofs-utils cryptsetup-bin \
+                squashfs-tools zstd qemu-utils python3-pefile sbsigntool openssl \
+                sudo systemd fdisk cpio kmod xz-utils >/dev/null
+              mkosi --version | tee /out/mkosi-version
+              /src/build.sh --manifest-format=json
+              cp /root/w/cpvm.manifest /out/ 2>/dev/null || true
+              chown -R "$(stat -c %u:%g /out)" /out
+            '
+          echo "BUILD_SECONDS=$(($(date +%s) - start))" >>"$GITHUB_ENV"
+
+      - name: Report
+        run: |
+          mkdir -p "$REPORT"
+          cp "$OUT"/dkb/kernel.cmdline "$REPORT"/
+          zstd -19 -T0 -q -o "$OUT/cpvm.raw.zst" "$OUT/cpvm.raw"
+          (cd "$OUT" && sha256sum cpvm.raw cpvm.raw.zst dkb/*) >"$REPORT/sha256sums.txt"
+          file -L "$OUT"/dkb/kernel "$OUT"/dkb/initrd >"$REPORT/kernel-file.txt"
+          sfdisk -d "$OUT/cpvm.raw" >"$REPORT/partitions.txt"
+          if [ -e "$OUT/cpvm.manifest" ]; then
+            cp "$OUT/cpvm.manifest" "$REPORT/"
+            jq -r '.packages[] | "\(.name) \(.version) \(.architecture)"' "$OUT/cpvm.manifest" | sort >"$REPORT/packages.txt"
+          fi
+          raw=$(stat -c %s "$OUT/cpvm.raw"); zst=$(stat -c %s "$OUT/cpvm.raw.zst")
+          {
+            echo "source: $GITHUB_SHA"
+            echo "arch: ${{ matrix.arch }} runner: ${{ matrix.runner }}"
+            echo "mkosi: $(cat "$OUT/mkosi-version")"
+            echo "roothash: $(tr ' ' '\n' <"$OUT/dkb/kernel.cmdline" | sed -n 's/^roothash=//p')"
+            echo "kernel package: $(grep -E '^linux-image-[0-9]' "$REPORT/packages.txt" 2>/dev/null || echo '?')"
+            echo "packages: $(wc -l <"$REPORT/packages.txt" 2>/dev/null || echo '?')"
+            echo "build_seconds: $BUILD_SECONDS"
+            echo "partition types: $(sed -n 's/.*type=\([0-9A-F-]*\).*name="\([^"]*\)".*/\2=\1/p' "$REPORT/partitions.txt" | tr '\n' ' ')"
+          } >"$REPORT/MANIFEST"
+          mib() { echo "$(( ($1 + 524288) / 1048576 )) MiB"; }
+          {
+            echo "## ${{ matrix.arch }} on ${{ matrix.runner }}"
+            echo
+            echo "build (container start to outputs): ${BUILD_SECONDS} s"
+            echo
+            echo "| | bytes | |"
+            echo "|---|---|---|"
+            echo "| cpvm.raw | $raw | $(mib "$raw") |"
+            echo "| cpvm.raw.zst (-19) | $zst | $(mib "$zst") |"
+            echo "| dkb/kernel | $(stat -c %s "$OUT/dkb/kernel") | |"
+            echo "| dkb/initrd | $(stat -c %s "$OUT/dkb/initrd") | |"
+            echo
+            echo '```'; cat "$REPORT/MANIFEST"; echo; cat "$REPORT/sha256sums.txt"; echo; cat "$REPORT/kernel-file.txt"; echo '```'
+            echo
+            echo "<details><summary>packages</summary>"
+            echo
+            echo '```'; cat "$REPORT/packages.txt" 2>/dev/null || echo "no manifest"; echo '```'
+            echo "</details>"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: mkosi-report-${{ matrix.arch }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/report
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mkosi-image-${{ matrix.arch }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/out/cpvm.raw.zst
+            ${{ runner.temp }}/out/dkb/
+          retention-days: 3
+          compression-level: 0
+
+      # Direct kernel boot as Lima does it, without Lima: no cidata and no
+      # state disk. Expected: cpstate finds no state disk and carries on;
+      # lima-init waits 90 s for cidata and fails, lima-boot fails with it;
+      # sshd starts after lima-init either way.
+      - name: Boot smoke test
+        continue-on-error: true
+        timeout-minutes: 20
+        run: |
+          sudo apt-get update -qq
+          if [ "${{ matrix.arch }}" = aarch64 ]; then
+            sudo apt-get install -y -qq --no-install-recommends qemu-system-arm >/dev/null
+          else
+            sudo apt-get install -y -qq --no-install-recommends qemu-system-x86 >/dev/null
+          fi
+          if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; fi
+          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then accel=kvm; else accel=tcg; fi
+          if [ "${{ matrix.arch }}" = aarch64 ]; then
+            qemu=qemu-system-aarch64 machine=virt early=earlycon
+            [ $accel = kvm ] && cpu=host || cpu=max,pauth-impdef=on
+            wait=900
+          else
+            qemu=qemu-system-x86_64 machine=q35 early=earlycon=uart8250,io,0x3f8
+            [ $accel = kvm ] && cpu=host || cpu=max
+            wait=300
+          fi
+          echo "accel: $accel" | tee -a "$GITHUB_STEP_SUMMARY"
+          log=$REPORT/serial-hvc0.log early_log=$REPORT/serial-early.log
+          : >"$log"
+          start=$(date +%s)
+          $qemu -machine $machine,accel=$accel -cpu $cpu -smp 2 -m 2048 \
+            -display none -monitor none -no-reboot \
+            -kernel "$OUT/dkb/kernel" -initrd "$OUT/dkb/initrd" \
+            -append "$(cat "$OUT/dkb/kernel.cmdline") $early keep_bootcon" \
+            -drive if=none,id=img,file="$OUT/cpvm.raw",format=raw,readonly=on -device virtio-blk-pci,drive=img \
+            -netdev user,id=n0 -device virtio-net-pci,netdev=n0,romfile= \
+            -device virtio-serial-pci -chardev file,id=hvc,path="$log" -device virtconsole,chardev=hvc \
+            -serial file:"$early_log" &
+          pid=$!
+          # systemd's status lines without colours and progress spinners
+          clean() { sed -E 's/\x1b(\[[0-9;]*[A-Za-z]|M)//g' "$log" | tr -d '\r' | grep -av 'Job .* running'; }
+          result=timeout
+          while [ $(($(date +%s) - start)) -lt $wait ]; do
+            if ! kill -0 $pid 2>/dev/null; then result=exited; break; fi
+            if clean | grep -qE 'Reached target .*Multi-User System'; then
+              result=pass
+              clean | grep -qE 'Finished systemd-veritysetup@root' || result=no-verity
+              clean | grep -qE 'Mounted sysroot\.mount' || result="$result,no-sysroot"
+              clean | grep -qE 'Started ssh\.service' || result="$result,no-sshd"
+              clean | grep -qE 'Started docker\.service' || result="$result,no-docker"
+              break
+            fi
+            sleep 2
+          done
+          elapsed=$(($(date +%s) - start))
+          kill $pid 2>/dev/null || true; wait $pid 2>/dev/null || true
+          {
+            echo "### boot smoke: $result after ${elapsed} s ($accel)"
+            echo '```'
+            clean | grep -aE '^\[ *(OK|FAILED) *\] .*(veritysetup@root|sysroot\.mount|Switching Root|ssh\.service|docker\.service|containerd|cpstate|lima-|Multi-User)|FAILED|Kernel panic' | head -40 || true
+            grep -aE 'Kernel panic' "$early_log" | head -5 || true
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          [ $result = pass ]
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: mkosi-boot-${{ matrix.arch }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/report/serial-*.log
+          if-no-files-found: ignore

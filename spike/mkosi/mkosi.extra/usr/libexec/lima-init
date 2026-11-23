@@ -1,0 +1,109 @@
+#!/bin/sh
+# lima-init: the part of Lima's cloud-init user-data that matters, without
+# cloud-init (python, 4 stages, ~2.5 s on the boot path, re-run every boot
+# anyway: Lima changes the instance-id each start and the overlay root forgets
+# everything). Same idea as Lima's own WSL2 no-cloud-init path
+# (pkg/driver/wsl2/boot.Linux/02-no-cloud-init-setup.sh). Lima's boot.sh then
+# runs from lima-boot.service, as cloud-init's per-boot script would.
+set -eu
+mnt=/mnt/lima-cidata
+mkdir -p -m 700 "$mnt"
+# blkid probes the devices itself: their nodes exist since the initrd (it
+# loads the CD-ROM drivers), while the by-label link waits for the main
+# system's udev coldplug (~1 s later, on sshd's path).
+if ! mountpoint -q "$mnt"; then
+	dev=$(blkid -L cidata 2>/dev/null) || {
+		udevadm wait --timeout=90 /dev/disk/by-label/cidata
+		dev=/dev/disk/by-label/cidata
+	}
+	mount -o ro,mode=0700,dmode=0700,overriderockperm,exec,uid=0 "$dev" "$mnt"
+fi
+ud=$mnt/user-data
+
+# shellcheck disable=SC2163
+while read -r line; do [ -n "$line" ] && export "$line"; done <"$mnt/lima.env"
+
+# The guest agent unit as Lima's 25-guestagent-base.sh will have
+# `lima-guestagent install-systemd` write it for this VM (the image ships
+# VZ's): when the file already matches, install-systemd skips its
+# daemon-reload, which holds PID 1 (and so session and container scope
+# creation) for 0.2-0.3 s while the workspace starts. 20-rootless-base.sh's
+# own daemon-reload runs before it and loads this file.
+if [ "${LIMA_CIDATA_VSOCK_PORT:-0}" != 0 ]; then
+	gaargs="--vsock-port $LIMA_CIDATA_VSOCK_PORT"
+elif [ -n "${LIMA_CIDATA_VIRTIO_PORT:-}" ]; then
+	gaargs="--virtio-port $LIMA_CIDATA_VIRTIO_PORT"
+elif [ "$LIMA_CIDATA_UID" -gt 0 ]; then
+	gaargs="--socket-owner $LIMA_CIDATA_UID"
+else
+	gaargs=
+fi
+[ "${LIMA_CIDATA_DEBUG:-false}" != true ] || gaargs="${gaargs:+$gaargs }--debug"
+ga=/etc/systemd/system/lima-guestagent.service
+sed "s|^ExecStart=.*|ExecStart=${LIMA_CIDATA_GUEST_INSTALL_PREFIX:-/usr/local}/bin/lima-guestagent daemon $gaargs --runtime-dir=\"%t/%N\"|" "$ga" >"$ga.new"
+mv "$ga.new" "$ga"
+
+h=$(sed -n 's/^local-hostname: *//p' "$mnt/meta-data")
+[ -z "$h" ] || { echo "$h" >/etc/hostname; hostname "$h"; }
+
+tz=$(sed -n 's/^timezone: *//p' "$ud")
+[ -z "$tz" ] || [ ! -e "/usr/share/zoneinfo/$tz" ] || ln -sf "/usr/share/zoneinfo/$tz" /etc/localtime
+
+# user (home persists on the state disk: don't re-copy skel)
+u=$LIMA_CIDATA_USER home=$LIMA_CIDATA_HOME
+if ! id "$u" >/dev/null 2>&1; then
+	m=-m
+	[ ! -d "$home" ] || m=-M
+	useradd -u "$LIMA_CIDATA_UID" -c "$LIMA_CIDATA_COMMENT" -d "$home" -s "$LIMA_CIDATA_SHELL" $m "$u"
+fi
+usermod -aG docker "$u"
+if [ "$LIMA_CIDATA_PASSWORDLESS_SUDO" = 1 ]; then
+	echo "$u ALL=(ALL) NOPASSWD:ALL" >/etc/sudoers.d/90-lima-users
+else
+	echo "$u ALL=(ALL) ALL" >/etc/sudoers.d/90-lima-users
+fi
+
+# ssh keys: the quoted list items under users[0].ssh-authorized-keys
+install -d -m 700 -o "$u" -g "$(id -g "$u")" "$home/.ssh"
+sed -n '/^ *ssh[-_]authorized[-_]keys:/,/^ *[^ -]/{s/^ *- *"\(.*\)"$/\1/p}' "$ud" >"$home/.ssh/authorized_keys"
+chown "$u:$(id -g "$u")" "$home/.ssh/authorized_keys"
+chmod 600 "$home/.ssh/authorized_keys"
+
+# virtiofs/9p mounts (cloud-init `mounts:`): - [tag, mountpoint, type, "opts", "0", "0"]
+tab=$(printf '\t')
+sed -n '/^mounts:/,/^[^ -]/{s/^- *\[\(.*\)\]$/\1/p}' "$ud" | tr -d '"' | sed "s/, /$tab/g" |
+	while IFS=$tab read -r tag mp type opts _; do
+		mkdir -p "$mp"
+		mountpoint -q "$mp" || mount -t "$type" -o "$opts" "$tag" "$mp" || echo "lima-init: mount $tag on $mp failed" >&2
+	done
+
+# Before sshd starts, so that Lima's boot scripts leave ssh alone: its
+# 07-etc-environment.sh rewrites /etc/environment the same way and, only when
+# that changes the file, kills the Lima user's sessions (`loginctl
+# terminate-user`: an open `limactl shell` exits 255); 11-colorterm-environment.sh
+# reloads sshd unless its drop-in exists (shipped in the image,
+# sshd_config.d/10-acceptenv-colorterm.conf). /run/credproxy-ssh-stable tells
+# credproxy it need not wait for the boot scripts before its first command.
+etcenv=/etc/environment
+[ ! -e "$etcenv" ] || sed -i '/#LIMA-START/,/#LIMA-END/d' "$etcenv"
+cat "$mnt/etc_environment" >>"$etcenv"
+: >/run/credproxy-ssh-stable
+# 07's signal to Lima's hostagent, which forwards the workspace's host
+# sockets only once it sees it (its "user session is ready" check): written
+# here, the forwards no longer wait for boot.sh to reach 07.
+echo "$LIMA_CIDATA_IID" >/run/lima-ssh-ready
+# 20-rootless-base.sh enables lingering a few seconds later anyway; doing it
+# now starts the user's systemd manager before the first ssh login, which
+# would otherwise wait for it (pam_systemd, 0.3-0.6 s).
+grep -q cpvm.nolinger /proc/cmdline || loginctl enable-linger "$u" || true
+
+# Lima user-data keys this shim does not implement: say so instead of silently diverging.
+# (bootcmd: only Lima's NIC-rename workaround, moot here, is expected.)
+for k in $(sed -n 's/^\([a-z_]*\):.*/\1/p' "$ud"); do
+	case $k in
+	growpart | timezone | users | write_files | manage_resolv_conf | resolv_conf | mounts | bootcmd) ;;
+	*) echo "lima-init: WARNING: user-data key '$k' not supported" >&2 ;;
+	esac
+done
+n=$(sed -n '/^bootcmd:/,/^[^ -]/p' "$ud" | grep -c '^- ' || true)
+[ "$n" -le 1 ] || echo "lima-init: WARNING: $n bootcmd entries, only the NIC workaround is expected; not run" >&2

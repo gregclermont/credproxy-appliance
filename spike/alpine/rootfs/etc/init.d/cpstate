@@ -1,0 +1,4 @@
+#!/sbin/openrc-run
+description="Workspace state disk (home, Docker data)"
+depend() { need cphw; }
+start() { /usr/libexec/cpvm/cpstate-setup; }

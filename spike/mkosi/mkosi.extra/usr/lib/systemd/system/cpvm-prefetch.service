@@ -1,0 +1,15 @@
+[Unit]
+Description=Read Docker's binaries into the page cache early
+# The root is erofs under dm-verity: every page dockerd and containerd fault
+# in at start is a cold read plus a hash check (~1 s of dockerd's start).
+# One sequential read early in the boot, while the rest of it waits on
+# devices, does that work ahead of them.
+DefaultDependencies=no
+ConditionKernelCommandLine=!cpvm.noprefetch
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'cat /usr/bin/containerd /usr/sbin/dockerd /usr/bin/docker /usr/bin/containerd-shim-runc-v2 /usr/sbin/runc /usr/sbin/xtables-nft-multi >/dev/null'
+
+[Install]
+WantedBy=sysinit.target

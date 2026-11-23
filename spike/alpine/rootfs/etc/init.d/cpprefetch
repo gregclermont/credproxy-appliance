@@ -1,0 +1,6 @@
+#!/sbin/openrc-run
+# As the mkosi image's cpvm-prefetch.service: read Docker's binaries early,
+# while the rest of the boot waits, so their page faults at start are hits.
+description="Read Docker's binaries into the page cache early"
+depend() { after devfs; }
+start() { (cat @PREFETCH@ >/dev/null 2>&1 &); }
